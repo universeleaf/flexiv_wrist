@@ -1,0 +1,45 @@
+# iKKEGOL-compatible triple USB foot pedal mapping for the Rizon 4S.
+#
+# Supervisor-intended mapping:
+#   Pedal 1 -> portable device function  (not implemented yet; action: none)
+#   Pedal 2 -> toggle Freedrive mode     (implemented; action: freedrive_toggle)
+#   Pedal 3 -> pre-programmed function   (not implemented yet; action: none)
+#
+# The default launcher uses X11 XInput to select this physical device by name
+# and USB ID. It does not need /dev/input permission and does not treat the
+# same key on a normal keyboard as a pedal event.
+#
+# To test that physical-device path without connecting the robot:
+#   python3 scripts/diagnose_xinput_foot_pedal.py --seconds 30
+#
+# This workstation currently reports a PCsensor FootSwitch keyboard interface
+# with USB ID 3553:b001. Re-run the diagnostic after replacing/reprogramming it.
+
+foot_pedal:
+  enabled: true
+  debounce_ms: 80
+
+  device:
+    # XInput must find exactly one slave keyboard matching this name and USB ID.
+    name_contains: "PCsensor FootSwitch Keyboard"
+    # Used only by the optional --foot-pedal-backend evdev fallback.
+    path: "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
+    vendor_id: 0x3553
+    product_id: 0xb001
+
+  pedals:
+    pedal_1:
+      key_code: null
+      action: none
+      intended_function: portable_device
+
+    pedal_2:
+      # Physical pedal emits Linux KEY_B (48); XInput source ID distinguishes
+      # this device from the normal keyboard.
+      key_code: 48
+      action: freedrive_toggle
+
+    pedal_3:
+      key_code: null
+      action: none
+      intended_function: pre_programmed

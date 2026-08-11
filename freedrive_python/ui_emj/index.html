@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>EmJ · Force Capture</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <p class="eyebrow">RIZON 4S · READ-ONLY FORCE ACQUISITION</p>
+          <h1>EmJ <span>Force Capture</span></h1>
+        </div>
+      </div>
+      <div class="status-cluster">
+        <div class="status-pill" id="robotStatus"><i></i><span>Connecting to robot</span></div>
+        <div class="status-pill" id="captureStatus"><i></i><span>Capture ready</span></div>
+        <div class="clock" id="clock">--:--:--</div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">FLEXIV ELEMENTS PROJECT</p>
+          <h2>Project / <strong>EmJ</strong></h2>
+          <p id="serviceMessage">Waiting for robot data. This UI never sends robot commands.</p>
+        </div>
+        <div class="capture-controls">
+          <div class="output-label">
+            <span>CSV OUTPUT</span>
+            <strong id="outputSummary">~/EmJ</strong>
+          </div>
+          <div class="timer" id="timer"><i></i><span id="timerLabel">READY</span><strong id="timerValue">00:00.0</strong></div>
+          <button class="button primary" id="startButton" type="button">● Start force capture</button>
+          <button class="button danger hidden" id="stopButton" type="button">■ Stop &amp; save CSV</button>
+        </div>
+      </section>
+
+      <section class="metric-grid">
+        <article class="metric-card accent-cyan">
+          <span>RESULTANT FORCE</span><div><strong id="forceNorm">0.00</strong><em>N</em></div>
+        </article>
+        <article class="metric-card"><span>Fx</span><div><strong id="fx">0.00</strong><em>N</em></div></article>
+        <article class="metric-card"><span>Fy</span><div><strong id="fy">0.00</strong><em>N</em></div></article>
+        <article class="metric-card"><span>Fz</span><div><strong id="fz">0.00</strong><em>N</em></div></article>
+        <article class="metric-card accent-orange">
+          <span>RESULTANT MOMENT</span><div><strong id="momentNorm">0.000</strong><em>Nm</em></div>
+        </article>
+        <article class="metric-card"><span>Mx</span><div><strong id="mx">0.000</strong><em>Nm</em></div></article>
+        <article class="metric-card"><span>My</span><div><strong id="my">0.000</strong><em>Nm</em></div></article>
+        <article class="metric-card"><span>Mz</span><div><strong id="mz">0.000</strong><em>Nm</em></div></article>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">6-AXIS WRENCH / LIVE</p><h3>End-effector force and moment</h3></div>
+          <div class="tools">
+            <label><span>Source</span>
+              <select id="sourceSelect">
+                <option value="tcp">Compensated TCP wrench · TCP frame</option>
+                <option value="world">Compensated TCP wrench · world frame</option>
+                <option value="sensor">Raw flange F/T sensor</option>
+              </select>
+            </label>
+            <label><span>Window</span>
+              <select id="windowSelect"><option value="10">10 sec</option><option value="20">20 sec</option><option value="60">60 sec</option></select>
+            </label>
+            <button class="button compact" id="tareButton" type="button">Display tare</button>
+            <button class="button compact ghost" id="clearButton" type="button">Clear plots</button>
+          </div>
+        </div>
+        <div class="chart-grid">
+          <div class="chart-wrap">
+            <div class="chart-title"><span>FORCE</span><div><i></i>Fx <i></i>Fy <i></i>Fz</div><strong>N</strong></div>
+            <canvas id="forceChart"></canvas>
+          </div>
+          <div class="chart-wrap">
+            <div class="chart-title"><span>MOMENT</span><div><i></i>Mx <i></i>My <i></i>Mz</div><strong>Nm</strong></div>
+            <canvas id="momentChart"></canvas>
+          </div>
+        </div>
+        <footer><span id="sampleTimestamp">No samples received</span><span>Display tare never changes the saved raw CSV</span></footer>
+      </section>
+
+      <section class="panel robot-panel">
+        <div><span>Robot</span><strong id="robotIdentity">Rizon4s-123456</strong></div>
+        <div><span>Mode</span><strong id="robotMode">—</strong></div>
+        <div><span>Operational</span><strong id="robotOperational">—</strong></div>
+        <div><span>Busy</span><strong id="robotBusy">—</strong></div>
+        <div><span>Assigned plan</span><strong id="assignedPlan">—</strong></div>
+        <div><span>RDK stream</span><strong id="sampleRate">—</strong></div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
