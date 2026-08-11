@@ -1,0 +1,23 @@
+# Allow non-root read/write of the iKKEGOL USB foot pedal input device.
+#
+# Install (once):
+#   sudo cp udev/99-ikkegol-foot-pedal.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#   sudo usermod -aG input "$USER"   # then log out and back in
+#   # unplug and replug the pedal
+#
+# Prefer matching by USB name. After running scripts/diagnose_foot_pedal.py,
+# you may add ATTRS{idVendor}/ATTRS{idProduct} lines with the printed hex IDs.
+
+# Match common iKKEGOL / generic HID foot-switch name strings on event nodes.
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="*iKKEGOL*", MODE="0660", GROUP="input", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="*IKKEGOL*", MODE="0660", GROUP="input", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="*FootSwitch*", MODE="0660", GROUP="input", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="*Foot Pedal*", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# Exact device detected on this workstation. Limit the rule to its keyboard
+# event interface so the companion mouse/absolute-input nodes are not grabbed.
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="3553", ATTRS{idProduct}=="b001", ENV{ID_INPUT_KEYBOARD}=="1", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# If the pedal hardware is replaced, obtain new IDs with diagnose_foot_pedal.py.

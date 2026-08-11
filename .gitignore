@@ -1,0 +1,28 @@
+# Python environments and caches
+**/.venv*
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+
+# CMake and compiled outputs
+**/build/
+**/build_*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+*.o
+*.a
+*.so
+
+# Runtime data and local backups
+*.bak-*
+*.csv
+*.log
+*.bin
+*.model
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
