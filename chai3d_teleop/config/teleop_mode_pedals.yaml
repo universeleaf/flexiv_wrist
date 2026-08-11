@@ -1,0 +1,28 @@
+# Three-pedal mode selector used only by run_9dof_teleop.py.
+#
+# Pedal 2 is already measured on this workstation: Linux KEY_B = 48.
+# Pedal 1 and Pedal 3 MUST be measured with diagnose_xinput_foot_pedal.py;
+# null is intentional and prevents real teleoperation with guessed key codes.
+
+foot_pedal:
+  enabled: true
+  debounce_ms: 80
+
+  device:
+    name_contains: "PCsensor FootSwitch Keyboard"
+    path: "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
+    vendor_id: 0x3553
+    product_id: 0xb001
+
+  pedals:
+    pedal_1:
+      key_code: 30
+      action: teleop_7dof
+
+    pedal_2:
+      key_code: 48
+      action: teleop_9dof
+
+    pedal_3:
+      key_code: 46
+      action: teleop_pivot_orientation
