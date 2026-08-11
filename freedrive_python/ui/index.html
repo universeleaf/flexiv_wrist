@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Annie · Vision & Force Monitor</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div>
+          <p class="eyebrow">RIZON 4S · READ-ONLY ACQUISITION</p>
+          <h1>Annie <span>Vision & Force Monitor</span></h1>
+        </div>
+      </div>
+      <div class="status-cluster">
+        <div class="status-pill" id="robotStatus">
+          <i></i><span>Connecting to robot</span>
+        </div>
+        <div class="status-pill camera" id="cameraStatus">
+          <i></i><span>Camera disconnected</span>
+        </div>
+        <div class="clock" id="clock">--:--:--</div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero-strip">
+        <div>
+          <p class="section-kicker">LIVE SESSION</p>
+          <h2>Project / <strong>Annie</strong></h2>
+          <p id="serviceMessage">Waiting for robot data. This UI monitors only and does not control the project.</p>
+        </div>
+        <div class="session-actions">
+          <div class="capture-scope">
+            <span>SYNCHRONIZED OUTPUT</span>
+            <strong id="outputSummary">CSV + FRAMES + MP4 → ~/Annie</strong>
+          </div>
+          <div class="record-timer" id="recordTimer">
+            <span class="record-dot"></span>
+            <span id="timerLabel">READY</span>
+            <strong id="timerValue">00:00.0</strong>
+          </div>
+          <button class="button primary" id="recordButton" type="button">
+            <span class="button-icon">●</span>Start synchronized capture
+          </button>
+          <button class="button danger hidden" id="stopButton" type="button">
+            <span class="button-icon">■</span>Stop & save
+          </button>
+        </div>
+      </section>
+
+      <section class="workspace-grid">
+        <article class="panel camera-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">PIXEL / UVC</p>
+              <h3>Camera feed</h3>
+            </div>
+            <div class="panel-tools">
+              <select id="cameraSelect" aria-label="Select camera">
+                <option value="">Select camera</option>
+              </select>
+              <button class="button compact" id="cameraButton" type="button">Connect camera</button>
+            </div>
+          </div>
+          <div class="video-stage">
+            <video id="cameraVideo" autoplay muted playsinline></video>
+            <div class="video-empty" id="videoEmpty">
+              <div class="aperture" aria-hidden="true"></div>
+              <strong id="videoEmptyTitle">Waiting for Pixel camera</strong>
+              <span id="videoEmptyHint">USB notification → Use USB for → Webcam</span>
+            </div>
+            <div class="video-overlay">
+              <span id="videoResolution">NO SIGNAL</span>
+              <span id="recordOverlay"><i></i>LIVE</span>
+            </div>
+          </div>
+          <div class="camera-foot">
+            <span>Chrome reads the camera directly; video does not use the robot network</span>
+            <span id="cameraName">—</span>
+          </div>
+        </article>
+
+        <aside class="metric-stack">
+          <article class="metric-card force">
+            <div class="metric-label"><i></i>RESULTANT FORCE</div>
+            <div><strong id="forceNorm">0.00</strong><span>N</span></div>
+            <p id="forceVector">Fx 0.00 · Fy 0.00 · Fz 0.00</p>
+          </article>
+          <article class="metric-card torque">
+            <div class="metric-label"><i></i>RESULTANT MOMENT</div>
+            <div><strong id="momentNorm">0.000</strong><span>Nm</span></div>
+            <p id="momentVector">Mx 0.000 · My 0.000 · Mz 0.000</p>
+          </article>
+          <article class="robot-card">
+            <div class="robot-card-head">
+              <span>ROBOT STATE</span>
+              <strong id="taskState">WAITING</strong>
+            </div>
+            <dl>
+              <div><dt>Robot</dt><dd id="robotIdentity">Rizon4s-123456</dd></div>
+              <div><dt>Mode</dt><dd id="robotMode">—</dd></div>
+              <div><dt>Operational</dt><dd id="robotOperational">—</dd></div>
+              <div><dt>Annie / Busy</dt><dd id="robotBusy">—</dd></div>
+              <div><dt>RDK stream</dt><dd id="sampleRate">—</dd></div>
+            </dl>
+          </article>
+        </aside>
+      </section>
+
+      <section class="panel charts-panel">
+        <div class="panel-heading chart-heading">
+          <div>
+            <p class="section-kicker">6-AXIS WRENCH / LIVE</p>
+            <h3>End-effector force and moment</h3>
+          </div>
+          <div class="panel-tools">
+            <label class="select-label">
+              <span>Source</span>
+              <select id="sourceSelect">
+                <option value="tcp">Compensated TCP wrench · TCP frame</option>
+                <option value="world">Compensated TCP wrench · world frame</option>
+                <option value="sensor">Raw flange F/T sensor</option>
+              </select>
+            </label>
+            <label class="select-label small">
+              <span>Window</span>
+              <select id="windowSelect">
+                <option value="10">10 sec</option>
+                <option value="20">20 sec</option>
+                <option value="60">60 sec</option>
+              </select>
+            </label>
+            <button class="button compact" id="tareButton" type="button">Display tare</button>
+            <button class="button compact ghost" id="clearButton" type="button">Clear</button>
+          </div>
+        </div>
+        <div class="chart-grid">
+          <div class="chart-wrap">
+            <div class="chart-title">
+              <span>FORCE</span>
+              <div><i class="x"></i>Fx <i class="y"></i>Fy <i class="z"></i>Fz</div>
+              <strong>N</strong>
+            </div>
+            <canvas id="forceChart"></canvas>
+          </div>
+          <div class="chart-wrap">
+            <div class="chart-title">
+              <span>MOMENT</span>
+              <div><i class="x"></i>Mx <i class="y"></i>My <i class="z"></i>Mz</div>
+              <strong>Nm</strong>
+            </div>
+            <canvas id="momentChart"></canvas>
+          </div>
+        </div>
+        <footer class="chart-foot">
+          <span id="sampleTimestamp">No samples received</span>
+          <span>Display tare affects this UI only and never writes settings to the robot</span>
+        </footer>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
