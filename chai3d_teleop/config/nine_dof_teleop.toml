@@ -1,9 +1,9 @@
 # Flexiv 7-DoF + two-moteus wrist mode-selection profile.
-# Run with: ../freedrive_python/.venv/bin/python scripts/run_9dof_teleop.py
+# Short entry point: python run.py <demo7|demo9|teleop|ui|...>
 
 [robot]
-robot_sn = "Rizon4s-123456"
-network_interface_ip = "127.0.0.1"
+robot_sn = "Rizon4s-062232"
+network_interface_ip = "192.168.2.27"
 command_rate_hz = 100
 max_linear_velocity_m_s = 0.5
 max_angular_velocity_rad_s = 1.0
@@ -17,9 +17,25 @@ device_rate_hz = 1000
 watchdog_ms = 100.0
 translation_scale = 2.0
 axis_map = "-x,-y,z"
+# Rotation is configured independently from translation. omega.7 device +X
+# points forward, +Y points right, and +Z points up. Forward/back handle pitch
+# is rotation about device Y and must remain a robot-Y rotation so it primarily
+# drives joint 8. Left/right handle roll is rotation about device X and remains
+# a robot-X rotation. Negating X and Y preserves the commissioned directions
+# and forms a proper right-handed map; the yaw sign is handled separately.
+rotation_axis_map = "-x,-y,z"
+# Reverse only the mapped yaw command: rotating the handle left now commands
+# the Flexiv/end effector left. Joint-8 forward/back pitch and translation are
+# unchanged.
+rotation_command_sign = [1.0, 1.0, -1.0]
 gravity_compensation = true
 # This local omega.7 damping is retained to suppress bilateral oscillation.
 teleop_damping_n_per_m_s = 12.0
+# Small handle motions caused by encoder noise or delayed force feedback do
+# not become robot commands. These are signal-conditioning deadbands, not
+# workspace limits; deliberate motion remains unrestricted.
+translation_deadband_m = 0.0004
+rotation_deadband_deg = 0.25
 
 [pedal]
 config_path = "teleop_mode_pedals.yaml"
@@ -31,11 +47,11 @@ backend = "xinput"
 # joint 8 is driven by ID2 and joint 9 is driven by ID1.
 calibration_ready = true
 ids = [2, 1]
-fdcanusb = "/dev/serial/by-id/usb-mjbots_fdcanusb_YOUR_SERIAL-if00"
+fdcanusb = "/dev/serial/by-id/usb-mjbots_fdcanusb_0FD8590C-if00"
 # Raw positions at the user-confirmed mechanical/kinematic neutral, in the
-# serial [ID2, ID1] order above. Use scripts/set_current_wrist_zero.py to save
+# serial [ID2, ID1] order above. Use `python run.py set-zero` to save
 # a newly positioned neutral without changing persistent moteus firmware.
-zero_position_rev = [-0.118164062, 0.191406250]
+zero_position_rev = [-0.121582031, 0.091552734]
 # Axes set true return to their calibrated zero at teleop startup and in
 # 7-DoF mode. ID1/joint 9 stays in STOP/read-only at startup and in mode 1;
 # it is enabled only when mode 2 or mode 3 actually commands both wrist axes.
@@ -43,25 +59,28 @@ zero_hold_mask = [true, false]
 # Positive joint 8 makes the distal wrist move forward; positive joint 9 is
 # clockwise when viewed from the probe/output side.
 motor_sign = [1.0, 1.0]
-# ID2 (joint 8) is -90..+90 deg. ID1 (joint 9) has 360 deg total travel,
-# represented continuously as -180..+180 deg about the measured neutral.
-joint_limit_deg = [90.0, 180.0]
+# ID2 (joint 8) is -90..+90 deg. ID1 (joint 9) can make one full turn in
+# either direction from zero, hence -360..+360 deg.
+joint_limit_deg = [90.0, 360.0]
 # Reducer ratios from the supplied HTDW datasheets, in the same [ID2, ID1]
 # order. moteus must be configured so its reported position and torque are at
 # the output shaft; these values are recorded in the bridge startup log.
 reduction_ratio = [36.0, 30.0]
 loop_rate_hz = 100.0
+# The RT demo uses a lower bridge rate to reduce two-controller query traffic
+# on fdcanusb. Flexiv remains at 1 kHz and reads the latest timestamped state.
+rt_osc_bridge_rate_hz = 50.0
 # Timeout for one fdcanusb/moteus query or command transaction. Increase this
 # in the UI if the USB adapter occasionally takes longer to respond.
-command_timeout_s = 2.0
+command_timeout_s = 4.0
 watchdog_ms = 100.0
 # The real-time 9-DoF demo crosses a non-RT Python + USB/CAN-FD bridge.  Use a
 # larger freshness/command window there so normal scheduling jitter does not
 # look like a disconnected wrist.  Genuine stale state still causes a STOP.
-rt_osc_state_timeout_ms = 250.0
+rt_osc_state_timeout_ms = 500.0
 # A brief USB scheduling stall enters a zero-wrist-torque/Flexiv-hold recovery
 # state. Only a continuous outage beyond this value terminates torque mode.
-rt_osc_hard_timeout_ms = 2000.0
+rt_osc_hard_timeout_ms = 5000.0
 zero_velocity_deg_s = 10.0
 zero_acceleration_deg_s2 = 20.0
 # The loaded reducer now settles with encoder samples alternating between
@@ -71,6 +90,13 @@ zero_acceleration_deg_s2 = 20.0
 zero_tolerance_deg = 2.5
 zero_settle_seconds = 0.2
 zero_timeout_s = 30.0
+# Startup zeroing has its own temporary gains. The loaded joint 8 previously
+# stalled at 2.55 deg with kp_scale=0.2 and only about 0.47 Nm applied torque.
+# The 0.35/1.0 pair was already exercised successfully by the wrist inertia
+# identification. It is used only while returning to zero and is not written
+# to moteus firmware.
+zero_position_kp_scale = [0.35, 0.35]
+zero_position_kd_scale = [1.0, 1.0]
 # Mode 1/2 position commands use a faster profile than startup zeroing so the
 # wrist motion is visible and does not lag the Flexiv arm.
 runtime_velocity_deg_s = 45.0
@@ -79,18 +105,68 @@ runtime_acceleration_deg_s2 = 180.0
 # This is not a workspace cap: it catches stale moteus trajectory state or a
 # feedback/configuration error before an axis can run hundreds of degrees.
 position_following_error_deg = 20.0
+# Do not stop on one encoder frame just over the tracking threshold. A real
+# sustained tracking failure still stops after this interval.
+position_following_error_timeout_s = 1.0
 # The controllers' persistent position gains are intentionally left intact.
 # Every position command temporarily scales them to suppress the measured
-# runaway/overshoot: ID2 kp/kd 1000/30 -> 50/15; ID1 1200/20 -> 60/10.
+# runaway/overshoot: ID2 kp/kd 1000/30 -> 200/30; ID1 1200/20 -> 240/20.
 # Pure torque OSC explicitly uses kp_scale=kd_scale=0 and is unaffected.
-position_kp_scale = [0.05, 0.05]
-position_kd_scale = [0.5, 0.5]
+position_kp_scale = [0.2, 0.2]
+position_kd_scale = [1.0, 1.0]
 # No additional low-torque commissioning cap. These are the actuator modules'
 # continuous rated output torques in [ID2/joint8, ID1/joint9] order. Never use
 # the 21/10 Nm locked-rotor values as continuous commands.
 position_torque_limit_nm = [6.0, 2.0]
 torque_limit_nm = [6.0, 2.0]
 soft_limit_margin_deg = 5.0
+# 9DoF OSC still computes the coupled joint target and full theoretical torque
+# for q8/q9. The commissioned 2024 moteus firmware accepted pure feed-forward
+# mode but applied only ~0.02 N.m, so the stable default uses its fast position
+# loop around the OSC target and sends only rate-limited gravity feed-forward.
+# This matches stable Mode-2 execution and avoids duplicate task/drive PD
+# stiffness. Set "pure_torque" only after a standalone torque test proves
+# requested and measured torque agree.
+osc_execution_mode = "hybrid_position_ff"
+# Stronger hybrid inner loop than normal teleoperation; these same scales were
+# stable during the successful 90 s inertia identification.
+osc_position_kp_scale = [0.35, 0.35]
+osc_position_kd_scale = [1.0, 1.0]
+
+[motor_pid]
+# Persistent moteus output-position PID. These match the stable values read
+# from the two drives on 2026-08-10. Editing the UI only saves this profile;
+# `python run.py apply-pid` explicitly applies and persists them to moteus.
+joint8_kp = 1000.0
+joint8_ki = 1.0
+joint8_kd = 30.0
+joint9_kp = 1200.0
+joint9_ki = 1.0
+joint9_kd = 20.0
+
+[demo]
+# Both demonstrations use this exact endpoint task.  The loop parameter radius
+# is 10 mm (maximum displacement from the captured start is 20 mm in X) while
+# continuously changing all three orientation
+# components.  7DoF and 9DoF therefore remain a fair comparison; only their
+# redundancy allocation differs.  A fixed-point 360-degree spin is deliberately
+# not the default: the recorded 7DoF run lost the task by 76 mm / about 90 deg
+# and drove the arm toward a fast, potentially self-colliding configuration.
+trajectory = "loop"
+# Control the wrist-axis intersection in both demos. This prevents the removed
+# probe TCP offset from exaggerating arm motion while still allowing the common
+# small closed position loop.
+endpoint = "pivot"
+period_s = 20.0
+radius_m = 0.010
+# The loop uses approximately [0.10A, 1.00A, 0.85A] on three harmonics. A=35
+# gives clear q8/q9 excursions while remaining far from the 180-degree branch.
+orientation_amplitude_deg = 35.0
+cpu_affinity = 2
+# The 7DoF torque controller is intentionally restored to the known-working
+# published implementation (commit 2f1e763): task gains 100/20 and 70/16,
+# null-space gains 8/2, operational damping 0.03, and tau=OSC+coriolis. The
+# common trajectory above is newer and unchanged; 9DoF keeps its own settings.
 
 [wrist_geometry]
 # Commissioning model in the Flexiv flange frame at q8=q9=0. The unchanged
@@ -121,27 +197,30 @@ link2_and_probe_com_after_joint2_m = [0.00395, -0.01555, 0.1153]
 joint_inertia_kg_m2 = [0.008, 0.003]
 # Body inertia tensors about each moving body's CoM, expressed in that body's
 # zero-configuration frame. These CAD-order estimates are used as the physical
-# basis of M(q); run scripts/calibrate_wrist_inertia.py to identify the scale,
+# basis of M(q); run `python run.py identify-inertia` to identify the scale,
 # reflected actuator inertia and friction from the actual assembly.
-link1_inertia_com_kg_m2_row_major = [0.0010, 0.0, 0.0, 0.0, 0.0010, 0.0, 0.0, 0.0, 0.0006]
-link2_and_probe_inertia_com_kg_m2_row_major = [0.0020, 0.0, 0.0, 0.0, 0.0020, 0.0, 0.0, 0.0, 0.0005]
+link1_inertia_com_kg_m2_row_major = [0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.0006]
+link2_and_probe_inertia_com_kg_m2_row_major = [0.002, 0.0, 0.0, 0.0, 0.002, 0.0, 0.0, 0.0, 0.0005]
 reflected_joint_inertia_kg_m2 = [0.008, 0.003]
 viscous_friction_nm_s_rad = [0.02, 0.02]
 coulomb_friction_nm = [0.05, 0.03]
 torque_bias_nm = [0.0, 0.0]
 inertia_calibration_path = "wrist_inertia_calibration.json"
+# Never silently run the real 9DoF controller with CAD/nominal wrist values.
+# A new physical assembly must pass identify-inertia + check-inertia first.
+require_identified_inertia = true
 
 [flexiv_tool]
 # Probe was removed and the no-probe assembly was recalibrated in Elements on
 # 2026-08-10. The read-only check reported a 3.019 N unloaded compensated
 # wrench; verify it at several arm attitudes before precision force control.
 calibration_ready = true
-# Read from scripts/check_flexiv_tool.py. The runtime accepts a nonzero active
+# Read with `python run.py check-tool`. The runtime accepts a nonzero active
 # TCP and converts every flange target back to the active Tool command pose.
 expected_name = "Wrist"
-expected_mass_kg = 0.906
-expected_com_m = [-0.0011, -0.0011, 0.0641]
-expected_inertia_kg_m2 = [0.001647, 0.001996, 0.001730, 0.000691, -0.000958, 0.000507]
+expected_mass_kg = 0.888
+expected_com_m = [0.0038, -0.0009, 0.0631]
+expected_inertia_kg_m2 = [6.4e-05, 7.8e-05, 0.000137, 6.7e-05, 1.4e-05, -1.2e-05]
 expected_tcp_location = [0.0166, 0.0469, 0.1448, 1.0, 0.0, 0.0, 0.0]
 tcp_position_tolerance_m = 0.002
 tcp_rotation_tolerance_deg = 1.0
@@ -152,20 +231,31 @@ inertia_tolerance_kg_m2 = 0.001
 [allocation]
 # Small DLS damping: lower means more aggressive wrist use near singularities.
 damping = 0.03
-# In mode 2 and the 9-DoF torque OSC demo, amplify the reachable wrist rotation
-# and let Flexiv compensate the residual at the flange. The final probe target
-# remains unchanged.
-wrist_priority_gain = 3.0
-# Direct output-joint tracking added after the dynamically consistent OSC
-# null-space term. This supplies enough breakaway torque for the measured
-# geared-wrist friction while Flexiv compensates the deliberately amplified
-# wrist motion at the probe task.
-wrist_tracking_kp_nm_per_rad = [8.0, 3.0]
-wrist_tracking_kd_nm_s_per_rad = [0.6, 0.25]
+# Natural 9DoF allocation: 1.0 means q8/q9 solve every reachable component of
+# the real target exactly once. The Flexiv arm solves only the residual. Values
+# above 1.0 are intentionally unsupported by the controller (no amplification).
+wrist_priority_gain = 1.0
+# Direct output-joint tracking used by the theoretical/pure-torque OSC path.
+# In the stable hybrid mode moteus' position loop supplies this tracking once,
+# so these PD terms are intentionally not sent again as feed-forward.
+wrist_tracking_kp_nm_per_rad = [3.0, 1.2]
+wrist_tracking_kd_nm_s_per_rad = [0.8, 0.35]
+# The raw IK result is passed through a critically damped second-order command
+# shaper before it reaches the torque controller. This removes branch/target
+# steps while retaining large, visible wrist excursions.
+wrist_target_filter_hz = 1.5
+wrist_target_max_velocity_deg_s = [30.0, 40.0]
+wrist_target_max_acceleration_deg_s2 = [120.0, 160.0]
+# The USB/CAN-FD wrist state arrives near 50 Hz while Flexiv OSC runs at
+# 1 kHz. Low-pass the repeated/noisy wrist velocity before it enters the task
+# damping and inverse dynamics; position remains the live measured value.
+wrist_state_velocity_filter_hz = 5.0
+torque_startup_ramp_s = 2.0
+stale_recovery_ramp_s = 1.0
 # In rectangle demo mode the probe follows the same tangent task as 7DoF,
 # while this periodic redundant motion makes both extra joints obvious. The
 # arm OSC compensates it so the requested probe pose is unchanged.
-wrist_rectangle_excursion_deg = [35.0, 60.0]
+wrist_rectangle_excursion_deg = [30.0, 120.0]
 # Retained for profile compatibility. The RT OSC now always uses the physical
 # identified M_wrist(q); wrist preference is implemented by a live orientation
 # IK redundancy objective instead of falsifying inertia and under-driving it.
@@ -173,6 +263,22 @@ osc_wrist_inertia_weight = 1.0
 max_iteration_step_deg = 4.0
 joint_limit_margin_deg = 2.0
 max_iterations = 30
+
+[osc_controller]
+# Cartesian impedance and null-space gains used by the real-time torque OSC.
+# Units are N/m, N.s/m, N.m/rad and N.m.s/rad as appropriate.
+translation_kp = 80.0
+translation_kd = 22.0
+rotation_kp = 45.0
+rotation_kd = 14.0
+nullspace_kp = 5.0
+nullspace_kd = 2.0
+# Physical actuator output limits and smooth torque-rate bounds. They reflect
+# hardware ratings and suppress command discontinuities; force magnitude never
+# causes the mission itself to quit.
+arm_torque_limit_nm = [20.0, 20.0, 15.0, 15.0, 8.0, 8.0, 5.0]
+arm_torque_slew_nm_s = [200.0, 200.0, 150.0, 150.0, 80.0, 80.0, 50.0]
+wrist_torque_slew_nm_s = [15.0, 8.0]
 
 [pivot_orientation_osc]
 # Rotational task-space impedance for the two wrist motors. The task moment is
@@ -189,7 +295,7 @@ wrist_priority_gain = 2.0
 # No haptic translation is applied; sensed Tool-Z uses the target below.
 # If probe +Z points down into the surface, pushing in +Z produces a sensed
 # reaction in -Z, hence -15 N.
-target_sensed_force_tool_z_n = -15.0
+target_sensed_force_tool_z_n = -5.0
 # X/Y remain position controlled. This bounds the Flexiv internal Tool-Z
 # force-axis velocity while its built-in force loop adjusts contact.
 force_axis_max_velocity_m_s = 0.02
@@ -222,13 +328,13 @@ max_device_force_n = 12.0
 # Stability layer for the delayed bilateral force path. It filters/rate-limits
 # the requested force and enforces time-domain passivity with a bounded energy
 # tank. These controls do not stop teleoperation when force reaches 12 N.
-wrench_lowpass_hz = 6.0
-force_slew_n_per_s = 30.0
-engagement_ramp_s = 0.75
-local_damping_n_per_m_s = 10.0
+wrench_lowpass_hz = 3.0
+force_slew_n_per_s = 15.0
+engagement_ramp_s = 1.2
+local_damping_n_per_m_s = 18.0
 passivity_enabled = true
 passivity_initial_energy_j = 0.02
-passivity_max_energy_j = 0.20
+passivity_max_energy_j = 0.2
 
 [runtime]
 # Real arm/wrist execution needs both fixed confirmation strings.
