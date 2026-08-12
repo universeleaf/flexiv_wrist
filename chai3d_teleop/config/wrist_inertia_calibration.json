@@ -2,25 +2,49 @@
   "schema_version": 1,
   "assembly_id": "wrist_without_probe_2026-08-10",
   "source_csv": "/tmp/wrist_inertia_samples.csv",
-  "sample_period_s": 0.00999970500015479,
-  "samples_used": 5300,
-  "rigid_body_scale": 19.612015626690898,
+  "sample_period_s": 0.009999946996686049,
+  "samples_used": 8300,
+  "rigid_body_scale": 1.1444010574739936,
   "reflected_joint_inertia_kg_m2": [
-    1e-06,
-    1e-06
-  ],
-  "viscous_friction_nm_s_rad": [
     0.0,
     0.0
   ],
+  "viscous_friction_nm_s_rad": [
+    0.0,
+    0.0794911764467281
+  ],
   "coulomb_friction_nm": [
-    0.7929111048232453,
-    0.3607269857279188
+    0.45366613770717157,
+    0.2268701993503068
   ],
   "torque_bias_nm": [
-    -1.9525860060881162,
-    0.18348943095073778
+    -0.06396137411861454,
+    0.004868969057794317
   ],
-  "fit_rms_torque_nm": 0.2600678733141338,
-  "regression_condition_number": 277.17884684050466
+  "fit_rms_torque_nm": 0.14871103373390449,
+  "fit_normalized_rms": 0.41030416412667386,
+  "validation_rms_torque_nm": 0.14857221544447055,
+  "validation_normalized_rms": 0.40956704185047027,
+  "regression_condition_number": 3.7334366904717444,
+  "excitation_q_span_deg": [
+    31.464843746386954,
+    55.634765640377566
+  ],
+  "excitation_dq_rms_rad_s": [
+    0.15272276145726552,
+    0.38158056174963534
+  ],
+  "excitation_ddq_rms_rad_s2": [
+    0.8886224546698721,
+    1.574575253492617
+  ],
+  "parameter_bound_hits": [
+    "reflected_joint8",
+    "reflected_joint9",
+    "viscous_joint8"
+  ],
+  "wrist_mass_matrix_min_eigenvalue": 0.0006152398566795196,
+  "wrist_mass_matrix_max_condition": 14.952832895952385,
+  "calibration_status": "PASS",
+  "calibration_failure_reasons": []
 }
