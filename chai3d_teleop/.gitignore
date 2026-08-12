@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+build/
+build_rt_osc/
+config/*.before-zero.toml
+config/*.ui-backup.toml
+archive/legacy_config_backups/

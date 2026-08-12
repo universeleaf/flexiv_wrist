@@ -19,7 +19,7 @@ set(CMAKE_EXPORT_NO_PACKAGE_REGISTRY ON CACHE BOOL
     "Do not write CHAI3D to the user package registry" FORCE)
 add_subdirectory("${CHAI3D_ROOT}" "${CMAKE_BINARY_DIR}/chai3d" EXCLUDE_FROM_ALL)
 
-add_executable(chai3d_device_stream cpp/chai3d_device_stream.cpp)
+add_executable(chai3d_device_stream hardware/chai3d_device_stream.cpp)
 target_compile_features(chai3d_device_stream PRIVATE cxx_std_17)
 target_compile_options(chai3d_device_stream PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(chai3d_device_stream PRIVATE LINUX)
@@ -48,10 +48,10 @@ if(BUILD_FLEXIV_RT_OSC)
   get_filename_component(FLEXIV_RDK_PREFIX
     "${flexiv_rdk_DIR}/../../.." ABSOLUTE)
   foreach(target IN ITEMS flexiv_7dof_torque_osc flexiv_9dof_torque_osc)
-    add_executable(${target} "cpp/${target}.cpp")
+    add_executable(${target} "controllers/cpp/${target}.cpp")
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/cpp")
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/controllers/cpp")
     target_link_libraries(${target} PRIVATE flexiv::flexiv_rdk)
     # The official RDK archive is static but several bundled dependencies are
     # shared libraries. Embed this workspace-local dependency directory so the
