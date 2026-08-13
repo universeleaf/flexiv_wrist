@@ -34,6 +34,11 @@ def _inertia(value: np.ndarray, name: str) -> np.ndarray:
     return result
 
 
+def _skew(value: np.ndarray) -> np.ndarray:
+    x, y, z = _vector(value, 3, "value")
+    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+
+
 @dataclass(frozen=True)
 class WristInertialParameters:
     link1_mass_kg: float
@@ -222,6 +227,69 @@ class WristDynamics:
             + jv2.T @ (p.link2_mass_kg * gravity_flange)
         )
         return -p.rigid_body_scale * generalized_gravity
+
+    def full_generalized_gravity_compensation(
+        self,
+        q_rad: np.ndarray,
+        flange_rotation_world: np.ndarray,
+        flange_jacobian_world: np.ndarray,
+        gravity_world_m_s2: np.ndarray = np.array([0.0, 0.0, -9.80665]),
+    ) -> np.ndarray:
+        """Return the moving wrist's complete 9-DoF gravity compensation.
+
+        The first seven entries are the gravity reaction seen by the Flexiv
+        arm; the last two act on the external wrist joints.  The flange
+        Jacobian uses twist order ``[linear; angular]`` in the world frame.
+        """
+        rotation = np.asarray(flange_rotation_world, dtype=float)
+        jacobian = np.asarray(flange_jacobian_world, dtype=float)
+        if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
+            raise ValueError("flange_rotation_world must be a finite 3x3 matrix")
+        if jacobian.shape != (6, 7) or not np.all(np.isfinite(jacobian)):
+            raise ValueError("flange_jacobian_world must be a finite 6x7 matrix")
+        q = _vector(q_rad, 2, "q_rad")
+        gravity_world = _vector(gravity_world_m_s2, 3, "gravity_world_m_s2")
+        p = self.parameters
+        c1, c2, _, _ = self._body_poses(q)
+        jv1, _, jv2, _, _, _ = self._body_jacobians(q)
+
+        def complete_linear_jacobian(
+            com_flange: np.ndarray, wrist_jacobian_flange: np.ndarray
+        ) -> np.ndarray:
+            offset_world = rotation @ com_flange
+            arm = jacobian[:3] - _skew(offset_world) @ jacobian[3:]
+            return np.column_stack((arm, rotation @ wrist_jacobian_flange))
+
+        full_jv1 = complete_linear_jacobian(c1, jv1)
+        full_jv2 = complete_linear_jacobian(c2, jv2)
+        generalized = (
+            full_jv1.T @ (p.link1_mass_kg * gravity_world)
+            + full_jv2.T @ (p.link2_mass_kg * gravity_world)
+        )
+        return -p.rigid_body_scale * generalized
+
+    def dynamic_gravity_compensation(
+        self,
+        q_rad: np.ndarray,
+        flange_rotation_world: np.ndarray,
+        flange_jacobian_world: np.ndarray,
+        gravity_world_m_s2: np.ndarray = np.array([0.0, 0.0, -9.80665]),
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(arm live-minus-zero, wrist full)`` gravity torques.
+
+        Flexiv's internal model already compensates the Elements Tool frozen
+        at q8=q9=0.  Subtracting the zero-pose arm contribution prevents double
+        compensation while retaining the live articulated correction.
+        """
+        live = self.full_generalized_gravity_compensation(
+            q_rad, flange_rotation_world, flange_jacobian_world,
+            gravity_world_m_s2,
+        )
+        zero = self.full_generalized_gravity_compensation(
+            np.zeros(2), flange_rotation_world, flange_jacobian_world,
+            gravity_world_m_s2,
+        )
+        return live[:7] - zero[:7], live[7:]
 
     def coriolis_torque(self, q_rad: np.ndarray, dq_rad_s: np.ndarray) -> np.ndarray:
         q = _vector(q_rad, 2, "q_rad")

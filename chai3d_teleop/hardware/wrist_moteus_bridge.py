@@ -402,6 +402,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop-hz", type=float, default=100.0)
     parser.add_argument("--command-timeout-s", type=float, default=1.0)
     parser.add_argument("--watchdog-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--drive-watchdog-ms",
+        type=float,
+        default=1000.0,
+        help=(
+            "moteus 内部位置/力矩命令 watchdog；应长于一次双电机串行通信。"
+            "上游命令 watchdog 仍由 --watchdog-ms 独立执行"
+        ),
+    )
     parser.add_argument("--soft-limit-margin-deg", type=float, default=5.0)
     parser.add_argument("--soft-limit-stiffness-nm-rad", type=float, default=1.0)
     parser.add_argument("--soft-limit-damping-nm-s-rad", type=float, default=0.08)
@@ -443,6 +452,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.loop_hz,
         args.command_timeout_s,
         args.watchdog_ms,
+        args.drive_watchdog_ms,
         args.soft_limit_margin_deg,
         args.soft_limit_stiffness_nm_rad,
         args.soft_limit_damping_nm_s_rad,
@@ -482,6 +492,7 @@ async def _run(args: argparse.Namespace) -> None:
     next_position_status = time.monotonic()
     next_torque_status = time.monotonic()
     torque_mode_mismatch_cycles = 0
+    position_mode_mismatch_cycles = 0
     torque_tracking_mismatch_cycles = [0, 0]
     following_violation_since: list[float | None] = [None, None]
     next_following_warning = time.monotonic()
@@ -583,7 +594,6 @@ async def _run(args: argparse.Namespace) -> None:
         command: list[float] = []
         last_command = time.monotonic()
         last_applied_operation = "I"
-
         while True:
             cycle = time.monotonic()
             while select.select([sys.stdin], [], [], 0.0)[0]:
@@ -679,7 +689,7 @@ async def _run(args: argparse.Namespace) -> None:
                             maximum_torque=torque_limit,
                             kp_scale=kp,
                             kd_scale=kd,
-                            watchdog_timeout=max(0.05, args.watchdog_ms / 1000.0),
+                            watchdog_timeout=args.drive_watchdog_ms / 1000.0,
                             ignore_position_bounds=1,
                             query=True,
                         ),
@@ -726,7 +736,7 @@ async def _run(args: argparse.Namespace) -> None:
                         maximum_torque=args.position_torque_nm[0],
                         kp_scale=args.position_kp_scale[0],
                         kd_scale=args.position_kd_scale[0],
-                        watchdog_timeout=max(0.05, args.watchdog_ms / 1000.0),
+                        watchdog_timeout=args.drive_watchdog_ms / 1000.0,
                         ignore_position_bounds=1,
                         query=True,
                     ),
@@ -785,7 +795,7 @@ async def _run(args: argparse.Namespace) -> None:
                             kp_scale=0.0,
                             kd_scale=0.0,
                             maximum_torque=torque_limit,
-                            watchdog_timeout=max(0.05, args.watchdog_ms / 1000.0),
+                            watchdog_timeout=args.drive_watchdog_ms / 1000.0,
                             ignore_position_bounds=1,
                             query=True,
                         ),
@@ -809,6 +819,34 @@ async def _run(args: argparse.Namespace) -> None:
                 _q_from_sample(sample, zero, sign)
                 for sample, zero, sign in zip(samples, session_zero_rev, args.motor_sign)
             ]
+            if operation in ("P", "P8"):
+                active_count = 1 if operation == "P8" else 2
+                expected_mode = int(moteus.Mode.POSITION)
+                bad_position_modes = [
+                    (motor_id, sample.mode, sample.fault)
+                    for motor_id, sample in zip(
+                        args.ids[:active_count], samples[:active_count]
+                    )
+                    if sample.mode != expected_mode
+                ]
+                position_mode_mismatch_cycles = (
+                    position_mode_mismatch_cycles + 1
+                    if bad_position_modes
+                    else 0
+                )
+                if position_mode_mismatch_cycles == 3:
+                    details = ", ".join(
+                        f"ID{motor_id} mode={mode} fault={fault}"
+                        for motor_id, mode, fault in bad_position_modes
+                    )
+                    print(
+                        "WRIST_POSITION_MODE_RECOVERY expected=10; "
+                        "继续重发位置命令自动恢复：" + details,
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                position_mode_mismatch_cycles = 0
             if operation in ("T", "H"):
                 expected_mode = int(moteus.Mode.POSITION)
                 bad_modes = [

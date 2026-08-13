@@ -7,6 +7,7 @@ import argparse
 from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass
+import json
 import math
 import os
 from pathlib import Path
@@ -45,12 +46,14 @@ sys.path.insert(0, str(FREEDRIVE_ROOT))
 
 from hardware.haptic_bridge import BridgeReader, ensure_robot_ready, wait_for_first_sample  # noqa: E402
 from controllers.nine_dof import (  # noqa: E402
+    Mode3ForceGate,
     PedalModeStateMachine,
     TeleopMode,
     WristGeometry,
     WristTargetShaper,
     allocate_wrist_orientation,
     flange_target_for_probe,
+    flange_target_for_probe_decoupled,
     operational_space_wrist_torque,
     orientation_only_target,
     parse_runtime_mode_command,
@@ -114,6 +117,10 @@ class Profile:
         return _section(self.document, "robot")
 
     @property
+    def home(self) -> dict[str, Any]:
+        return _section(self.document, "home")
+
+    @property
     def haptic(self) -> dict[str, Any]:
         return _section(self.document, "haptic")
 
@@ -136,6 +143,14 @@ class Profile:
     @property
     def osc_controller(self) -> dict[str, Any]:
         return _section(self.document, "osc_controller")
+
+    @property
+    def teleop_osc(self) -> dict[str, Any]:
+        return _section(self.document, "teleop_osc")
+
+    @property
+    def teleop_impedance(self) -> dict[str, Any]:
+        return _section(self.document, "teleop_impedance")
 
     @property
     def demo(self) -> dict[str, Any]:
@@ -214,6 +229,7 @@ def load_profile(path: Path) -> Profile:
         "loop_rate_hz",
         "command_timeout_s",
         "watchdog_ms",
+        "drive_watchdog_ms",
         "rt_osc_state_timeout_ms",
         "rt_osc_hard_timeout_ms",
         "zero_velocity_deg_s",
@@ -266,6 +282,13 @@ def load_profile(path: Path) -> Profile:
     ):
         raise ValueError(
             "allocation.wrist_target_max_acceleration_deg_s2 不能超过腕部运行加速度"
+        )
+    tracking_lead = _vector(
+        allocation, "teleop_wrist_max_tracking_lead_deg", 2
+    )
+    if np.any(tracking_lead <= 0.0) or np.any(tracking_lead >= 20.0):
+        raise ValueError(
+            "allocation.teleop_wrist_max_tracking_lead_deg 必须是两个 (0,20) 内的值"
         )
     for key in (
         "wrist_target_filter_hz",
@@ -341,6 +364,7 @@ def load_profile(path: Path) -> Profile:
         "rotational_stiffness_nm_per_rad",
         "wrist_priority_gain",
         "force_axis_max_velocity_m_s",
+        "force_command_ramp_s",
         "force_frame_update_hz",
         "force_frame_update_angle_deg",
     ):
@@ -351,8 +375,13 @@ def load_profile(path: Path) -> Profile:
     if not math.isfinite(rotational_damping) or rotational_damping < 0.0:
         raise ValueError("rotational_damping_nm_s_per_rad 不能为负数")
     target_force = float(osc.get("target_sensed_force_tool_z_n", math.nan))
-    if not math.isfinite(target_force):
-        raise ValueError("模式 3 target_sensed_force_tool_z_n 必须是有限数值")
+    if not math.isfinite(target_force) or target_force == 0.0:
+        raise ValueError("模式 3 target_sensed_force_tool_z_n 必须是有限非零数值")
+    force_axis_velocity = float(osc["force_axis_max_velocity_m_s"])
+    if not 0.005 <= force_axis_velocity <= 2.0:
+        raise ValueError(
+            "pivot_orientation_osc.force_axis_max_velocity_m_s 必须在 [0.005,2.0]"
+        )
     if str(osc.get("force_source")) not in {"raw", "filtered"}:
         raise ValueError("pivot_orientation_osc.force_source 只能是 raw 或 filtered")
     _positive(osc, "force_display_lowpass_hz")
@@ -368,15 +397,46 @@ def load_profile(path: Path) -> Profile:
         "torque_bias_nm",
     ):
         _vector(payload, key, 2)
+    identification = _section(document, "inertia_identification")
+    duration_s = _positive(identification, "duration_s")
+    if duration_s < 20.0:
+        raise ValueError("inertia_identification.duration_s 必须至少为 20 秒")
+    amplitudes = _vector(identification, "amplitude_deg", 2)
+    if np.any(amplitudes <= 0.0) or np.any(amplitudes >= np.rad2deg(limits)):
+        raise ValueError(
+            "inertia_identification.amplitude_deg 必须为正且小于两轴物理行程"
+        )
+    for key in ("position_kp_scale", "position_kd_scale"):
+        values = _vector(identification, key, 2)
+        if np.any(values <= 0.0) or np.any(values > 1.0):
+            raise ValueError(
+                f"inertia_identification.{key} 必须是两个 (0,1] 内的值"
+            )
     robot = _section(document, "robot")
     if not str(robot.get("robot_sn", "")).strip():
         raise ValueError("robot_sn 不能为空")
+    home = _section(document, "home")
+    _vector(home, "reference_joint_position_deg", 7)
+    for key in (
+        "final_lift_world_z_m",
+        "final_lift_max_linear_velocity_m_s",
+        "final_lift_max_linear_acceleration_m_s2",
+        "final_lift_position_tolerance_m",
+        "final_lift_settle_s",
+        "final_lift_timeout_s",
+        "command_rate_hz",
+    ):
+        _positive(home, key)
     parse_axis_map(str(_section(document, "haptic").get("axis_map", "")))
     haptic = _section(document, "haptic")
     for key in ("translation_deadband_m", "rotation_deadband_deg"):
         value = float(haptic.get(key, math.nan))
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"haptic.{key} 必须是有限非负数")
+    for key in ("rotation_command_sign", "mode1_rotation_command_sign"):
+        signs = _vector(haptic, key, 3)
+        if not np.all(np.isin(signs, [-1.0, 1.0])):
+            raise ValueError(f"haptic.{key} 只能包含 -1 或 +1")
     motor_pid = _section(document, "motor_pid")
     for key in (
         "joint8_kp", "joint8_kd", "joint9_kp", "joint9_kd"
@@ -414,6 +474,208 @@ def load_profile(path: Path) -> Profile:
         values = _vector(osc_controller, key, length)
         if np.any(values <= 0.0):
             raise ValueError(f"osc_controller.{key} 必须全部为正数")
+    if not isinstance(
+        osc_controller.get("dynamic_wrist_gravity_compensation"), bool
+    ):
+        raise ValueError(
+            "osc_controller.dynamic_wrist_gravity_compensation 必须是布尔值"
+        )
+    _positive(osc_controller, "dynamic_gravity_filter_hz")
+    teleop_osc = _section(document, "teleop_osc")
+    for key in (
+        "target_filter_hz",
+        "command_timeout_ms",
+        "max_linear_velocity_m_s",
+        "max_linear_acceleration_m_s2",
+        "max_angular_velocity_rad_s",
+        "max_angular_acceleration_rad_s2",
+        "arm_translation_kp",
+        "arm_translation_kd",
+        "arm_rotation_kp",
+        "arm_rotation_kd",
+        "mode2_arm_rotation_kp",
+        "mode2_arm_rotation_kd",
+        "mode2_arm_max_angular_velocity_rad_s",
+        "mode2_arm_max_angular_acceleration_rad_s2",
+        "teleop_wrist_target_filter_hz",
+        "max_operational_damping",
+        "singularity_characteristic_length_m",
+        "singularity_slow_sigma",
+        "singularity_critical_sigma",
+        "singularity_min_motion_scale",
+        "posture_reference_rate_per_s",
+        "clutch_hold_natural_frequency_hz",
+        "clutch_hold_damping_ratio",
+        "mode3_position_kp",
+        "mode3_position_kd",
+        "mode3_arm_rotation_kp",
+        "mode3_arm_rotation_kd",
+        "mode3_arm_max_angular_velocity_rad_s",
+        "mode3_arm_max_angular_acceleration_rad_s2",
+        "mode3_contact_enable_threshold_n",
+        "mode3_contact_release_threshold_n",
+        "mode3_contact_release_delay_s",
+        "mode3_force_tolerance_n",
+        "mode3_force_full_position_error_m",
+        "mode3_force_disable_position_error_m",
+        "mode3_force_integral_limit_n",
+        "mode3_force_command_limit_n",
+    ):
+        _positive(teleop_osc, key)
+    mode2_posture_rate = float(
+        teleop_osc.get("mode2_posture_reference_rate_per_s", math.nan)
+    )
+    if (
+        not math.isfinite(mode2_posture_rate)
+        or mode2_posture_rate < 0.0
+        or mode2_posture_rate > 10.0
+    ):
+        raise ValueError(
+            "teleop_osc.mode2_posture_reference_rate_per_s 必须在 [0,10]"
+        )
+    for key in (
+        "teleop_wrist_target_max_velocity_deg_s",
+        "teleop_wrist_target_max_acceleration_deg_s2",
+    ):
+        values = _vector(teleop_osc, key, 2)
+        if np.any(values <= 0.0):
+            raise ValueError(f"teleop_osc.{key} 必须全部为正数")
+    feedforward_gain = float(
+        teleop_osc.get("target_velocity_feedforward_gain", math.nan)
+    )
+    if (
+        not math.isfinite(feedforward_gain)
+        or feedforward_gain < 0.0
+        or feedforward_gain > 1.0
+    ):
+        raise ValueError(
+            "teleop_osc.target_velocity_feedforward_gain 必须在 [0,1]"
+        )
+    singularity_slow = float(teleop_osc["singularity_slow_sigma"])
+    singularity_critical = float(teleop_osc["singularity_critical_sigma"])
+    if singularity_slow <= singularity_critical:
+        raise ValueError(
+            "teleop_osc.singularity_slow_sigma 必须大于 critical_sigma"
+        )
+    singularity_min_scale = float(
+        teleop_osc["singularity_min_motion_scale"]
+    )
+    if singularity_min_scale > 1.0:
+        raise ValueError(
+            "teleop_osc.singularity_min_motion_scale 必须不大于 1"
+        )
+    if float(teleop_osc["clutch_hold_damping_ratio"]) < 1.0:
+        raise ValueError("teleop_osc.clutch_hold_damping_ratio 必须不小于 1")
+    if (
+        float(teleop_osc["mode3_contact_release_threshold_n"])
+        >= float(teleop_osc["mode3_contact_enable_threshold_n"])
+    ):
+        raise ValueError(
+            "teleop_osc.mode3_contact_release_threshold_n 必须小于 enable threshold"
+        )
+    if (
+        float(teleop_osc["mode3_force_disable_position_error_m"])
+        <= float(teleop_osc["mode3_force_full_position_error_m"])
+    ):
+        raise ValueError(
+            "teleop_osc.mode3_force_disable_position_error_m 必须大于 full threshold"
+        )
+    for key in (
+        "mode3_force_kp",
+        "mode3_force_ki_per_s",
+        "mode3_force_damping_n_s_m",
+    ):
+        value = float(teleop_osc.get(key, math.nan))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"teleop_osc.{key} 必须是有限非负数")
+    if not isinstance(teleop_osc.get("cpu_affinity"), int):
+        raise ValueError("teleop_osc.cpu_affinity 必须是整数")
+    if str(teleop_osc.get("inertia_mode")) not in {"auto", "legacy-block"}:
+        raise ValueError("teleop_osc.inertia_mode 必须是 auto 或 legacy-block")
+    teleop_impedance = _section(document, "teleop_impedance")
+    stiffness_scale = _vector(teleop_impedance, "stiffness_scale", 6)
+    if np.any(stiffness_scale <= 0.0) or np.any(stiffness_scale > 1.0):
+        raise ValueError(
+            "teleop_impedance.stiffness_scale 必须是六个 (0,1] 内的值"
+        )
+    released_stiffness_scale = _vector(
+        teleop_impedance, "released_stiffness_scale", 6
+    )
+    if (
+        np.any(released_stiffness_scale <= 0.0)
+        or np.any(released_stiffness_scale > stiffness_scale)
+    ):
+        raise ValueError(
+            "teleop_impedance.released_stiffness_scale 必须是六个正数且不大于 active scale"
+        )
+    damping_ratio = _vector(teleop_impedance, "damping_ratio", 6)
+    if np.any(damping_ratio < 0.3) or np.any(damping_ratio > 0.8):
+        raise ValueError(
+            "teleop_impedance.damping_ratio 必须是六个 [0.3,0.8] 内的值"
+        )
+    mode3_stiffness_scale = _vector(
+        teleop_impedance, "mode3_stiffness_scale", 6
+    )
+    if np.any(mode3_stiffness_scale <= 0.0) or np.any(
+        mode3_stiffness_scale > 1.0
+    ):
+        raise ValueError(
+            "teleop_impedance.mode3_stiffness_scale 必须是六个 (0,1] 内的值"
+        )
+    mode3_damping_ratio = _vector(
+        teleop_impedance, "mode3_damping_ratio", 6
+    )
+    if np.any(mode3_damping_ratio < 0.3) or np.any(mode3_damping_ratio > 0.8):
+        raise ValueError(
+            "teleop_impedance.mode3_damping_ratio 必须是六个 [0.3,0.8] 内的值"
+        )
+    for key in (
+        "nullspace_linear_manipulability",
+        "nullspace_angular_manipulability",
+    ):
+        value = float(teleop_impedance.get(key, math.nan))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"teleop_impedance.{key} 必须在 [0,1]")
+    nullspace_tracking = float(
+        teleop_impedance.get("nullspace_reference_tracking", math.nan)
+    )
+    if not math.isfinite(nullspace_tracking) or not 0.1 <= nullspace_tracking <= 1.0:
+        raise ValueError(
+            "teleop_impedance.nullspace_reference_tracking 必须在 [0.1,1]"
+        )
+    released_nullspace_tracking = float(
+        teleop_impedance.get(
+            "released_nullspace_reference_tracking", math.nan
+        )
+    )
+    if (
+        not math.isfinite(released_nullspace_tracking)
+        or not 0.0 <= released_nullspace_tracking <= nullspace_tracking
+    ):
+        raise ValueError(
+            "teleop_impedance.released_nullspace_reference_tracking 必须在 [0,active tracking]"
+        )
+    mode3_nullspace_tracking = float(
+        teleop_impedance.get("mode3_nullspace_reference_tracking", math.nan)
+    )
+    if (
+        not math.isfinite(mode3_nullspace_tracking)
+        or not 0.1 <= mode3_nullspace_tracking <= 1.0
+    ):
+        raise ValueError(
+            "teleop_impedance.mode3_nullspace_reference_tracking 必须在 [0.1,1]"
+        )
+    runtime = _section(document, "runtime")
+    if str(runtime.get("teleop_controller")) not in {
+        "flexiv_impedance",
+        "torque_osc",
+    }:
+        raise ValueError(
+            "runtime.teleop_controller 只能是 flexiv_impedance 或 torque_osc"
+        )
+    telemetry_rate_hz = _positive(runtime, "ui_telemetry_rate_hz")
+    if telemetry_rate_hz > 50.0:
+        raise ValueError("runtime.ui_telemetry_rate_hz 必须不大于 50 Hz")
     return Profile(path.resolve(), document, geometry, pedal_config_path.resolve())
 
 
@@ -545,6 +807,8 @@ class WristBridge:
             str(wrist["command_timeout_s"]),
             "--watchdog-ms",
             str(watchdog_ms),
+            "--drive-watchdog-ms",
+            str(wrist["drive_watchdog_ms"]),
             "--soft-limit-margin-deg",
             str(wrist["soft_limit_margin_deg"]),
             "--fdcanusb",
@@ -879,7 +1143,107 @@ def _active_tcp_pose_for_flange_target(
     return transform_to_pose(target @ tool_transform)
 
 
-def _run_real(
+def build_ui_telemetry(
+    *,
+    timestamp_s: float,
+    mode: TeleopMode | None,
+    enabled: bool,
+    actual_probe_world: np.ndarray,
+    target_probe_world: np.ndarray,
+    arm_actual_q_rad: np.ndarray,
+    arm_reference_q_rad: np.ndarray,
+    wrist_actual_q_rad: np.ndarray,
+    wrist_target_q_rad: np.ndarray,
+    force_measured_tool_z_n: float,
+    force_estimated_tool_z_n: float,
+    force_target_tool_z_n: float,
+    force_command_tool_z_n: float,
+    force_control_active: bool,
+) -> dict[str, Any]:
+    """Build one finite, unit-labelled UI telemetry sample.
+
+    Flexiv's Cartesian controller does not expose an internal seven-joint
+    trajectory.  Therefore J1--J7 use the exact null-space posture reference
+    that this coordinator sends to Flexiv. J8--J9 use the actual moteus target.
+    Endpoint quantities always refer to the physical probe/TCP, including the
+    live external-wrist geometry.
+    """
+    actual_probe = np.asarray(actual_probe_world, dtype=float)
+    target_probe = np.asarray(target_probe_world, dtype=float)
+    if actual_probe.shape != (4, 4) or target_probe.shape != (4, 4):
+        raise ValueError("UI telemetry probe transforms must be 4x4")
+    arm_actual = np.asarray(arm_actual_q_rad, dtype=float)
+    arm_reference = np.asarray(arm_reference_q_rad, dtype=float)
+    wrist_actual = np.asarray(wrist_actual_q_rad, dtype=float)
+    wrist_target = np.asarray(wrist_target_q_rad, dtype=float)
+    if arm_actual.shape != (7,) or arm_reference.shape != (7,):
+        raise ValueError("UI telemetry arm joints must be 7-vectors")
+    if wrist_actual.shape != (2,) or wrist_target.shape != (2,):
+        raise ValueError("UI telemetry wrist joints must be 2-vectors")
+    inputs = (
+        actual_probe,
+        target_probe,
+        arm_actual,
+        arm_reference,
+        wrist_actual,
+        wrist_target,
+    )
+    force_values = (
+        force_measured_tool_z_n,
+        force_estimated_tool_z_n,
+        force_target_tool_z_n,
+        force_command_tool_z_n,
+    )
+    if (
+        not math.isfinite(timestamp_s)
+        or not all(math.isfinite(value) for value in force_values)
+        or not all(np.all(np.isfinite(values)) for values in inputs)
+    ):
+        raise ValueError("UI telemetry inputs must be finite")
+
+    position_error_m = target_probe[:3, 3] - actual_probe[:3, 3]
+    orientation_error_rad = rotation_vector(
+        target_probe[:3, :3] @ actual_probe[:3, :3].T
+    )
+    joint_actual_rad = np.concatenate((arm_actual, wrist_actual))
+    joint_target_rad = np.concatenate((arm_reference, wrist_target))
+    joint_error_rad = joint_target_rad - joint_actual_rad
+    return {
+        "timestamp_s": float(timestamp_s),
+        "mode": mode.value if mode is not None else "waiting",
+        "enabled": bool(enabled),
+        "position_actual_m": actual_probe[:3, 3].tolist(),
+        "position_target_m": target_probe[:3, 3].tolist(),
+        "orientation_actual_rotvec_deg": np.rad2deg(
+            rotation_vector(actual_probe[:3, :3])
+        ).tolist(),
+        "orientation_target_rotvec_deg": np.rad2deg(
+            rotation_vector(target_probe[:3, :3])
+        ).tolist(),
+        "position_error_mm": (position_error_m * 1000.0).tolist(),
+        "position_error_norm_mm": float(np.linalg.norm(position_error_m) * 1000.0),
+        "orientation_error_rotvec_deg": np.rad2deg(
+            orientation_error_rad
+        ).tolist(),
+        "orientation_error_norm_deg": float(
+            math.degrees(np.linalg.norm(orientation_error_rad))
+        ),
+        "joint_actual_deg": np.rad2deg(joint_actual_rad).tolist(),
+        "joint_target_deg": np.rad2deg(joint_target_rad).tolist(),
+        "joint_error_deg": np.rad2deg(joint_error_rad).tolist(),
+        "force_measured_tool_z_n": float(force_measured_tool_z_n),
+        "force_estimated_tool_z_n": float(force_estimated_tool_z_n),
+        "force_target_tool_z_n": float(force_target_tool_z_n),
+        "force_command_tool_z_n": float(force_command_tool_z_n),
+        "force_control_active": bool(force_control_active),
+        "arm_joint_target_kind": "nullspace_reference",
+        "wrist_joint_target_kind": "commanded_position",
+        "force_measurement_kind": "flexiv_world_wrench_projected_to_live_probe_z",
+        "force_estimate_kind": "first_order_lowpass_of_projected_measurement",
+    }
+
+
+def _run_real_nrt_legacy(
     profile: Profile,
     mode3_force_n: float | None = None,
     *,
@@ -893,6 +1257,7 @@ def _run_real(
     payload = profile.payload
     allocation = profile.allocation
     osc = profile.osc
+    teleop_osc = profile.teleop_osc
     force_feedback = profile.force_feedback
     ui_mode_commands = RuntimeModeCommandReader() if ui_control_stdin else None
     configured_mode3_force_n = float(osc["target_sensed_force_tool_z_n"])
@@ -907,27 +1272,39 @@ def _run_real(
         if abs(mode3_force_n) > abs(configured_mode3_force_n):
             raise ValueError("--mode3-force-n 不能超过配置的任务力幅值")
         effective_mode3_force_n = mode3_force_n
+    mapping_config = MappingConfig(
+        translation_scale=_positive(haptic_cfg, "translation_scale"),
+        translation_deadband_m=float(haptic_cfg["translation_deadband_m"]),
+        rotation_deadband_rad=math.radians(
+            float(haptic_cfg["rotation_deadband_deg"])
+        ),
+        max_translation_m=None,
+        max_step_m=float(robot_cfg["max_linear_velocity_m_s"])
+        / float(robot_cfg["command_rate_hz"]),
+        enable_rotation=True,
+        max_rotation_rad=None,
+        max_angular_step_rad=float(robot_cfg["max_angular_velocity_rad_s"])
+        / float(robot_cfg["command_rate_hz"]),
+    )
+    translation_axis_map = parse_axis_map(str(haptic_cfg["axis_map"]))
+    rotation_axis_map = parse_axis_map(
+        str(haptic_cfg.get("rotation_axis_map", haptic_cfg["axis_map"]))
+    )
     mapper = RelativePoseMapper(
-        MappingConfig(
-            translation_scale=_positive(haptic_cfg, "translation_scale"),
-            translation_deadband_m=float(haptic_cfg["translation_deadband_m"]),
-            rotation_deadband_rad=math.radians(
-                float(haptic_cfg["rotation_deadband_deg"])
-            ),
-            max_translation_m=None,
-            max_step_m=float(robot_cfg["max_linear_velocity_m_s"])
-            / float(robot_cfg["command_rate_hz"]),
-            enable_rotation=True,
-            max_rotation_rad=None,
-            max_angular_step_rad=float(robot_cfg["max_angular_velocity_rad_s"])
-            / float(robot_cfg["command_rate_hz"]),
-        ),
-        parse_axis_map(str(haptic_cfg["axis_map"])),
-        rotation_axis_map=parse_axis_map(
-            str(haptic_cfg.get("rotation_axis_map", haptic_cfg["axis_map"]))
-        ),
+        mapping_config,
+        translation_axis_map,
+        rotation_axis_map=rotation_axis_map,
         rotation_command_sign=_vector(haptic_cfg, "rotation_command_sign", 3),
     )
+    mode1_mapper = RelativePoseMapper(
+        mapping_config,
+        translation_axis_map,
+        rotation_axis_map=rotation_axis_map,
+        rotation_command_sign=_vector(
+            haptic_cfg, "mode1_rotation_command_sign", 3
+        ),
+    )
+    command_mapper = mapper
 
     with ExitStack() as stack:
         pedal = stack.enter_context(_open_pedal(profile))
@@ -980,27 +1357,109 @@ def _run_real(
                 "脚踏板选择模式，omega.7 clutch 控制当前模式启停。"
             )
             print(
-                f"模式 3 本次 Tool-Z sensed force={effective_mode3_force_n:+.1f}N"
-                + (
-                    "（低力方向验证）"
-                    if mode3_force_n is not None
-                    else "（任务配置）"
-                )
-            )
-            print(
-                "模式 3：omega.7 只输入姿态；Flexiv 末端力传感器的世界坐标力"
-                "按实时 q8/q9 旋转到探针坐标；X/Y 位置控制，探针 Z 使用 Flexiv 内置力控制。"
-            )
-            print(
-                f"力控制轴：只闭环探针 Fz={effective_mode3_force_n:+.2f}N；"
-                "不启动、不读取外置力传感器。"
+                "统一遥操作后端：Mode 1/2 使用 Flexiv 内置笛卡尔阻抗；"
+                "Mode 3 在同一会话使用柔和混合操作空间控制和腕部 OSC。"
             )
             robot.SwitchMode(flexivrdk.Mode.NRT_CARTESIAN_MOTION_FORCE)
             robot_in_motion = True
             robot.SetForceControlAxis([False] * 6)
             states = robot.states()
+            impedance = profile.teleop_impedance
+            nominal_stiffness = np.asarray(robot.info().K_x_nom, dtype=float)
+            if nominal_stiffness.shape != (6,) or not np.all(
+                np.isfinite(nominal_stiffness)
+            ):
+                raise RuntimeError("Flexiv 返回的 K_x_nom 不是有效六维刚度")
+            active_cartesian_stiffness = nominal_stiffness * _vector(
+                impedance, "stiffness_scale", 6
+            )
+            released_cartesian_stiffness = nominal_stiffness * _vector(
+                impedance, "released_stiffness_scale", 6
+            )
+            cartesian_damping_ratio = _vector(
+                impedance, "damping_ratio", 6
+            )
+            mode3_cartesian_stiffness = nominal_stiffness * _vector(
+                impedance, "mode3_stiffness_scale", 6
+            )
+            mode3_cartesian_damping_ratio = _vector(
+                impedance, "mode3_damping_ratio", 6
+            )
+            active_nullspace_objectives = (
+                float(impedance["nullspace_linear_manipulability"]),
+                float(impedance["nullspace_angular_manipulability"]),
+                float(impedance["nullspace_reference_tracking"]),
+            )
+            released_nullspace_objectives = (
+                active_nullspace_objectives[0],
+                active_nullspace_objectives[1],
+                float(impedance["released_nullspace_reference_tracking"]),
+            )
+            mode3_nullspace_objectives = (
+                active_nullspace_objectives[0],
+                active_nullspace_objectives[1],
+                float(impedance["mode3_nullspace_reference_tracking"]),
+            )
+
+            def set_impedance(
+                active: bool, mode: TeleopMode | None = None
+            ) -> None:
+                if active and mode is TeleopMode.PIVOT_ORIENTATION:
+                    stiffness = mode3_cartesian_stiffness
+                    damping = mode3_cartesian_damping_ratio
+                    objectives = mode3_nullspace_objectives
+                elif active:
+                    stiffness = active_cartesian_stiffness
+                    damping = cartesian_damping_ratio
+                    objectives = active_nullspace_objectives
+                else:
+                    stiffness = released_cartesian_stiffness
+                    damping = cartesian_damping_ratio
+                    objectives = released_nullspace_objectives
+                robot.SetCartesianImpedance(
+                    stiffness.tolist(), damping.tolist()
+                )
+                robot.SetNullSpaceObjectives(*objectives)
+
+            # The process starts with the clutch released. Keep a soft spring
+            # around the captured TCP so hand force can visibly deflect it.
+            arm_reference_q = np.asarray(states.q, dtype=float).copy()
+            robot.SetNullSpacePosture(arm_reference_q.tolist())
+            set_impedance(False)
             held_tcp_pose = np.asarray(states.tcp_pose, dtype=float).copy()
             robot.SendCartesianMotionForce(held_tcp_pose.tolist())
+            print(
+                "Mode 1/2 controller=Flexiv NRT Cartesian impedance; "
+                "Kx=[{}], damping_ratio=[{}].".format(
+                    ", ".join(
+                        f"{value:.1f}" for value in active_cartesian_stiffness
+                    ),
+                    ", ".join(
+                        f"{value:.2f}" for value in cartesian_damping_ratio
+                    ),
+                )
+            )
+            print(
+                "clutch-released soft Kx=[{}], nullspace_tracking={:.2f}.".format(
+                    ", ".join(
+                        f"{value:.1f}" for value in released_cartesian_stiffness
+                    ),
+                    released_nullspace_objectives[2],
+                )
+            )
+            print(
+                "Mode 3 gentle hybrid OSC Kx=[{}], damping_ratio=[{}], "
+                "force-axis max velocity={:.3f}m/s, force ramp={:.1f}s.".format(
+                    ", ".join(
+                        f"{value:.1f}" for value in mode3_cartesian_stiffness
+                    ),
+                    ", ".join(
+                        f"{value:.2f}" for value in mode3_cartesian_damping_ratio
+                    ),
+                    float(osc["force_axis_max_velocity_m_s"]),
+                    float(osc["force_command_ramp_s"]),
+                )
+            )
             feedback_field = (
                 "ext_wrench_in_world_raw"
                 if str(force_feedback["source"]) == "raw"
@@ -1044,6 +1503,10 @@ def _run_real(
             mode_has_engaged = False
             wrist_hold_q = wrist_state.q_rad.copy()
             wrist_goal_q = wrist_hold_q.copy()
+            wrist_arm_allocation_q = wrist_hold_q.copy()
+            wrist_tracking_lead_rad = np.deg2rad(
+                _vector(allocation, "teleop_wrist_max_tracking_lead_deg", 2)
+            )
             wrist_target_shaper = WristTargetShaper(
                 filter_hz=float(allocation["wrist_target_filter_hz"]),
                 max_velocity_rad_s=np.deg2rad(
@@ -1072,8 +1535,26 @@ def _run_real(
             period = 1.0 / int(robot_cfg["command_rate_hz"])
             next_tick = time.monotonic()
             next_print = 0.0
+            telemetry_epoch_s = time.monotonic()
+            telemetry_period_s = 1.0 / float(
+                profile.runtime["ui_telemetry_rate_hz"]
+            )
+            next_telemetry_s = telemetry_epoch_s
             force_axis_active = False
             force_command_z_n = 0.0
+            mode3_force_gate = Mode3ForceGate(
+                target_force_n=effective_mode3_force_n,
+                contact_enable_threshold_n=float(
+                    teleop_osc["mode3_contact_enable_threshold_n"]
+                ),
+                contact_release_threshold_n=float(
+                    teleop_osc["mode3_contact_release_threshold_n"]
+                ),
+                contact_release_delay_s=float(
+                    teleop_osc["mode3_contact_release_delay_s"]
+                ),
+                force_ramp_s=float(osc["force_command_ramp_s"]),
+            )
             probe_force_filtered_n = np.zeros(3)
             probe_force_filter_initialized = False
             probe_force_z_n = math.nan
@@ -1132,6 +1613,7 @@ def _run_real(
                 measured_probe_force = probe_force_from_world(
                     flexiv_force_world, current_probe[:3, :3]
                 )
+                probe_force_measured_z_n = float(measured_probe_force[2])
                 force_alpha = 1.0 - math.exp(
                     -2.0 * math.pi * float(osc["force_display_lowpass_hz"]) * period
                 )
@@ -1156,7 +1638,9 @@ def _run_real(
                         robot.SetForceControlAxis([False] * 6)
                         force_axis_active = False
                         force_command_z_n = 0.0
+                    mode3_force_gate.reset()
                     selector.select(mode, clutch_pressed=pressed)
+                    set_impedance(False)
                     selected_mode = mode
                     was_enabled = False
                     mode_has_engaged = False
@@ -1164,6 +1648,7 @@ def _run_real(
                     target_probe = frozen_probe.copy()
                     wrist_hold_q = wrist_state.q_rad.copy()
                     wrist_goal_q = wrist_hold_q.copy()
+                    wrist_arm_allocation_q = wrist_hold_q.copy()
                     wrist_target_shaper.reset(wrist_state.q_rad)
                     mode1_hold_q = wrist_state.q_rad.copy()
                     mode1_hold_q[zero_hold_mask] = 0.0
@@ -1185,8 +1670,12 @@ def _run_real(
                             if centering_mode1
                             else (
                                 "Joint 9 保持 STOP；松开后再按 clutch 开始"
-                                if mode is not TeleopMode.ARM_7DOF
-                                else "松开后再按 clutch 开始"
+                                if mode is TeleopMode.ARM_WRIST_9DOF
+                                else (
+                                    "先轻触测试面；松开后再按 clutch 开始仅姿态+恒力"
+                                    if mode is TeleopMode.PIVOT_ORIENTATION
+                                    else "松开后再按 clutch 开始"
+                                )
                             )
                         )
                     )
@@ -1223,7 +1712,14 @@ def _run_real(
                     wrist_hold_q = wrist_state.q_rad.copy()
                     probe_anchor = current_probe.copy()
                     target_probe = probe_anchor.copy()
-                    mapper.capture(haptic_sample, transform_to_pose(probe_anchor))
+                    command_mapper = (
+                        mode1_mapper
+                        if selected_mode is TeleopMode.ARM_7DOF
+                        else mapper
+                    )
+                    command_mapper.capture(
+                        haptic_sample, transform_to_pose(probe_anchor)
+                    )
                     haptic_anchor_rotation = haptic_sample.rotation.copy()
                     haptic_rotation_delta_deg.fill(0.0)
                     probe_target_rotation_delta_deg.fill(0.0)
@@ -1232,29 +1728,28 @@ def _run_real(
                     flange_anchor_rotation = pose_to_transform(states.flange_pose)[:3, :3]
                     wrist_anchor_rotation = profile.geometry.forward(wrist_state.q_rad)[:3, :3]
                     wrist_goal_q = wrist_state.q_rad.copy()
+                    wrist_arm_allocation_q = wrist_state.q_rad.copy()
                     wrist_target_shaper.reset(wrist_state.q_rad)
                     mode_has_engaged = True
+                    # The built-in Cartesian task is redundant. Capture the
+                    # current arm posture at the clutch edge so it does not
+                    # choose a remote solution while tracking the same TCP.
+                    arm_reference_q = np.asarray(states.q, dtype=float).copy()
+                    robot.SetNullSpacePosture(arm_reference_q.tolist())
+                    set_impedance(True, selected_mode)
                     if selected_mode is TeleopMode.PIVOT_ORIENTATION:
                         robot.SetForceControlFrame(
                             flexivrdk.CoordType.WORLD,
                             transform_to_pose(current_probe).tolist(),
                         )
-                        max_force_axis_velocity = float(
-                            osc["force_axis_max_velocity_m_s"]
-                        )
-                        robot.SetForceControlAxis(
-                            [False, False, True, False, False, False],
-                            # Flexiv RDK 1.9 requires a fixed-size [Vx,Vy,Vz]
-                            # vector even when only Tool-Z is force controlled.
-                            [max_force_axis_velocity] * 3,
-                        )
-                        force_axis_active = True
-                        # The Flexiv estimated external wrench is already the
-                        # feedback used by its built-in force controller.  By
-                        # setting the arbitrary force frame to the live probe
-                        # orientation, command Z is exactly probe/TCP Z; no
-                        # delayed external-sensor cascade is needed.
-                        force_command_z_n = effective_mode3_force_n
+                        # Keep all axes position-controlled until a real light
+                        # contact is measured in the configured Tool-Z force
+                        # direction.  The contact gate below then enables only
+                        # Z force control and ramps gently to the task force.
+                        robot.SetForceControlAxis([False] * 6)
+                        force_axis_active = False
+                        force_command_z_n = 0.0
+                        mode3_force_gate.reset()
                         last_force_frame_rotation = current_probe[:3, :3].copy()
                         next_force_frame_update = time.monotonic()
                     stable_feedback.reset()
@@ -1264,11 +1759,11 @@ def _run_real(
                 if enabled:
                     haptic_rotation_delta_deg = np.rad2deg(
                         rotation_vector(
-                            haptic_sample.rotation @ haptic_anchor_rotation.T
+                            haptic_anchor_rotation.T @ haptic_sample.rotation
                         )
                     )
                     mapped_probe_target = pose_to_transform(
-                        mapper.target(haptic_sample)
+                        command_mapper.target(haptic_sample)
                     )
                     if selected_mode is TeleopMode.PIVOT_ORIENTATION:
                         # Mode 3 deliberately discards every haptic translation
@@ -1282,7 +1777,7 @@ def _run_real(
 
                     probe_target_rotation_delta_deg = np.rad2deg(
                         rotation_vector(
-                            target_probe[:3, :3] @ probe_anchor[:3, :3].T
+                            probe_anchor[:3, :3].T @ target_probe[:3, :3]
                         )
                     )
 
@@ -1319,8 +1814,23 @@ def _run_real(
                             joint_margin_rad=math.radians(_positive(allocation, "joint_limit_margin_deg")),
                             max_iterations=int(allocation["max_iterations"]),
                         )
+                        # This unshaped IK result defines which orientation is
+                        # geometrically reachable by q8/q9. Mode 2 must not ask
+                        # Flexiv to perform that component merely because the
+                        # physical wrist position command is rate-limited.
+                        wrist_arm_allocation_q = result.q_target_rad.copy()
                         wrist_goal_q = wrist_target_shaper.step(
                             result.q_target_rad, period
+                        )
+                        # Keep a moving target window around live feedback. It
+                        # does not cap total travel: the window advances as the
+                        # joint moves. If a cable/obstruction stalls an axis,
+                        # the command cannot accumulate a large error and tear
+                        # down the complete teleoperation process.
+                        wrist_goal_q = np.clip(
+                            wrist_goal_q,
+                            wrist_state.q_rad - wrist_tracking_lead_rad,
+                            wrist_state.q_rad + wrist_tracking_lead_rad,
                         )
                         if selected_mode is TeleopMode.ARM_WRIST_9DOF:
                             wrist.command_position(wrist_goal_q)
@@ -1353,7 +1863,16 @@ def _run_real(
                                 osc_result.orientation_error_rad
                             )
                             wrist_command_torque_nm = osc_result.torque_nm.copy()
-                            wrist.command_torque(osc_result.torque_nm)
+                            # The outer loop remains an operational-space wrist
+                            # controller: it computes the orientation target and
+                            # model feed-forward torque.  The commissioned moteus
+                            # firmware produces little motion for a pure NaN-
+                            # position feed-forward command, so the drive's fast
+                            # inner position loop tracks the OSC joint target and
+                            # the modeled torque is added as feed-forward.
+                            wrist.command_hybrid(
+                                wrist_goal_q, osc_result.torque_nm
+                            )
 
                             frame_error = float(
                                 np.linalg.norm(
@@ -1378,14 +1897,69 @@ def _run_real(
                                 next_force_frame_update = time.monotonic() + 1.0 / float(
                                     osc["force_frame_update_hz"]
                                 )
-                            force_command_z_n = effective_mode3_force_n
+                            force_gate_result = mode3_force_gate.update(
+                                probe_force_z_n,
+                                teleoperation_enabled=True,
+                                now_s=time.monotonic(),
+                            )
+                            if force_gate_result.changed:
+                                if force_gate_result.force_axis_enabled:
+                                    robot.SetForceControlFrame(
+                                        flexivrdk.CoordType.WORLD,
+                                        transform_to_pose(target_probe).tolist(),
+                                    )
+                                    max_force_axis_velocity = float(
+                                        osc["force_axis_max_velocity_m_s"]
+                                    )
+                                    robot.SetForceControlAxis(
+                                        [False, False, True, False, False, False],
+                                        # RDK 1.9 requires [Vx,Vy,Vz] even
+                                        # when only force-frame Z is enabled.
+                                        [max_force_axis_velocity] * 3,
+                                    )
+                                    force_axis_active = True
+                                    print(
+                                        "Mode 3：检测到同方向接触，柔和启用 Tool-Z 力控制。"
+                                    )
+                                else:
+                                    robot.SetForceControlAxis([False] * 6)
+                                    force_axis_active = False
+                                    print(
+                                        "Mode 3：接触已丢失，退回固定点位置保持；等待重新接触。"
+                                    )
+                            force_command_z_n = (
+                                force_gate_result.commanded_force_n
+                                if force_axis_active
+                                else 0.0
+                            )
                             command_wrench[2] = force_command_z_n
 
+                    # In Modes 2/3 the raw geometric IK allocation defines what
+                    # q8/q9 can ultimately produce. The arm does not temporarily
+                    # take over while the shaped/torque-controlled wrist catches
+                    # up; it supplies only the residual third orientation axis.
+                    if selected_mode in {
+                        TeleopMode.ARM_WRIST_9DOF,
+                        TeleopMode.PIVOT_ORIENTATION,
+                    }:
+                        # Raw IK owns the reachable orientation, while live q
+                        # owns the offset-tip translation. Hence a slow/stalled
+                        # joint cannot make Flexiv rotate in its place, but the
+                        # actual TCP point remains fixed throughout the motion.
+                        flange_target = flange_target_for_probe_decoupled(
+                            target_probe,
+                            profile.geometry,
+                            wrist_arm_allocation_q,
+                            wrist_state.q_rad,
+                        )
+                    else:
+                        flange_target = flange_target_for_probe(
+                            target_probe,
+                            profile.geometry,
+                            wrist_state.q_rad,
+                        )
                     held_tcp_pose = _active_tcp_pose_for_flange_target(
-                        flange_target_for_probe(
-                            target_probe, profile.geometry, wrist_state.q_rad
-                        ),
-                        flange_to_active_tcp,
+                        flange_target, flange_to_active_tcp
                     )
                 elif not centering_mode1:
                     if was_enabled:
@@ -1393,11 +1967,18 @@ def _run_real(
                             robot.SetForceControlAxis([False] * 6)
                             force_axis_active = False
                             force_command_z_n = 0.0
+                        mode3_force_gate.reset()
                         held_tcp_pose = np.asarray(states.tcp_pose, dtype=float).copy()
+                        target_probe = current_probe.copy()
                         wrist_hold_q = wrist_state.q_rad.copy()
+                        wrist_goal_q = wrist_hold_q.copy()
                         wrist_target_shaper.reset(wrist_hold_q)
+                        set_impedance(False)
                         haptic.zero_force_feedback()
-                        print("clutch 松开：Flexiv 冻结，腕部切回位置保持")
+                        print(
+                            "clutch 松开：捕获当前 TCP，Flexiv 切换为低刚度阻抗；"
+                            "可用外力推开，撤力后返回该点。腕部切回位置保持。"
+                        )
                     hold_joint8, hold_joint9 = wrist_hold_axes(
                         selected_mode, mode_has_engaged
                     )
@@ -1471,6 +2052,35 @@ def _run_real(
                     max_linear_acc=float(robot_cfg["max_linear_acceleration_m_s2"]),
                     max_angular_acc=float(robot_cfg["max_angular_acceleration_rad_s2"]),
                 )
+                telemetry_now_s = time.monotonic()
+                if telemetry_now_s >= next_telemetry_s:
+                    telemetry = build_ui_telemetry(
+                        timestamp_s=telemetry_now_s - telemetry_epoch_s,
+                        mode=selected_mode,
+                        enabled=enabled,
+                        actual_probe_world=current_probe,
+                        target_probe_world=target_probe,
+                        arm_actual_q_rad=np.asarray(states.q, dtype=float),
+                        arm_reference_q_rad=arm_reference_q,
+                        wrist_actual_q_rad=wrist_state.q_rad,
+                        wrist_target_q_rad=wrist_goal_q,
+                        force_measured_tool_z_n=probe_force_measured_z_n,
+                        force_estimated_tool_z_n=probe_force_z_n,
+                        force_target_tool_z_n=effective_mode3_force_n,
+                        force_command_tool_z_n=force_command_z_n,
+                        force_control_active=force_axis_active,
+                    )
+                    print(
+                        "TELEMETRY "
+                        + json.dumps(
+                            telemetry,
+                            ensure_ascii=True,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                    next_telemetry_s = telemetry_now_s + telemetry_period_s
                 if time.monotonic() >= next_print:
                     print(
                         "mode={} ready={} clutch_pressed={} enabled={} "
@@ -1520,9 +2130,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-config", action="store_true", help="只验证配置，不连接任何硬件")
     parser.add_argument("--pedal-test", type=float, metavar="SECONDS", help="只测试三脚踏板模式事件")
     parser.add_argument(
+        "--controller",
+        choices=("flexiv-impedance", "torque-osc"),
+        help=(
+            "控制后端：Flexiv 内置笛卡尔阻抗，或自定义 1kHz 力矩 OSC；"
+            "默认读取 runtime.teleop_controller"
+        ),
+    )
+    parser.add_argument(
         "--mode3-force-n",
         type=float,
-        help="仅本次运行降低模式3的 Tool-Z sensed force；不能反向或超过配置幅值",
+        help="仅本次运行覆盖模式3 Tool-Z sensed force（单位 N）",
     )
     parser.add_argument(
         "--ui-control-stdin",
@@ -1530,6 +2148,35 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     return parser
+
+
+def _run_real(
+    profile: Profile,
+    mode3_force_n: float | None = None,
+    *,
+    ui_control_stdin: bool = False,
+    controller: str | None = None,
+) -> int:
+    """Select the built-in Flexiv impedance or custom torque-OSC backend."""
+    selected = controller
+    if selected is None:
+        configured = str(profile.runtime["teleop_controller"])
+        selected = configured.replace("_", "-")
+    if selected == "flexiv-impedance":
+        return _run_real_nrt_legacy(
+            profile,
+            mode3_force_n,
+            ui_control_stdin=ui_control_stdin,
+        )
+    if selected == "torque-osc":
+        from scripts.teleoperate_rt import run
+
+        return run(
+            profile,
+            mode3_force_n,
+            ui_control_stdin=ui_control_stdin,
+        )
+    raise ValueError(f"未知遥操作控制后端: {selected}")
 
 
 def main() -> int:
@@ -1540,6 +2187,12 @@ def main() -> int:
             print(f"配置语法和几何结构有效: {profile.path}")
             print(f"wrist.calibration_ready={profile.wrist.get('calibration_ready')}")
             print("外置力传感器: 已从运行时与配置中移除")
+            print(
+                "teleop_controller={}".format(
+                    args.controller
+                    or str(profile.runtime["teleop_controller"]).replace("_", "-")
+                )
+            )
             print(
                 "force_feedback.enabled={} passivity_enabled={}".format(
                     profile.force_feedback.get("enabled"),
@@ -1555,6 +2208,7 @@ def main() -> int:
             profile,
             args.mode3_force_n,
             ui_control_stdin=args.ui_control_stdin,
+            controller=args.controller,
         )
     except KeyboardInterrupt:
         print("\n收到 Ctrl-C：Flexiv Stop、腕部 STOP、触觉力归零。", file=sys.stderr)

@@ -61,6 +61,7 @@ STATUS_RE = re.compile(
     r"mode=(\S+) ready=(\d) clutch_pressed=(\d) enabled=(\d)"
 )
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+TELEMETRY_PREFIX = "TELEMETRY "
 
 
 def _primary_error(current: str, message: str) -> str:
@@ -120,6 +121,8 @@ class TeleopProcessManager:
         self._reader: threading.Thread | None = None
         self._logs: deque[tuple[int, str]] = deque(maxlen=5000)
         self._sequence = 0
+        self._telemetry: deque[tuple[int, dict[str, Any]]] = deque(maxlen=6000)
+        self._telemetry_sequence = 0
         self._state: dict[str, Any] = {
             "running": False,
             "pid": None,
@@ -138,6 +141,18 @@ class TeleopProcessManager:
         message = ANSI_ESCAPE_RE.sub("", line.rstrip("\r\n"))
         if not message:
             return
+        if message.startswith(TELEMETRY_PREFIX):
+            try:
+                sample = json.loads(message[len(TELEMETRY_PREFIX):])
+                if not isinstance(sample, dict):
+                    raise ValueError("telemetry payload is not an object")
+            except (json.JSONDecodeError, ValueError) as error:
+                message = f"[UI] Ignored malformed telemetry: {error}"
+            else:
+                with self._lock:
+                    self._telemetry_sequence += 1
+                    self._telemetry.append((self._telemetry_sequence, sample))
+                return
         with self._lock:
             self._sequence += 1
             self._logs.append((self._sequence, message))
@@ -223,6 +238,7 @@ class TeleopProcessManager:
                 start_new_session=True,
             )
             self._process = process
+            self._telemetry.clear()
             self._state.update(
                 running=True,
                 pid=process.pid,
@@ -276,7 +292,9 @@ class TeleopProcessManager:
             )
             return self.status()
 
-    def status(self, since: int = 0) -> dict[str, Any]:
+    def status(
+        self, since: int = 0, telemetry_since: int = 0
+    ) -> dict[str, Any]:
         with self._lock:
             state = dict(self._state)
             state["last_sequence"] = self._sequence
@@ -284,6 +302,12 @@ class TeleopProcessManager:
                 {"sequence": sequence, "line": line}
                 for sequence, line in self._logs
                 if sequence > since
+            ]
+            state["last_telemetry_sequence"] = self._telemetry_sequence
+            state["telemetry"] = [
+                {"sequence": sequence, "sample": sample}
+                for sequence, sample in self._telemetry
+                if sequence > telemetry_since
             ]
             return state
 
@@ -419,9 +443,9 @@ INDEX_HTML = r"""<!doctype html>
     .chip.warn { color:#211606; background:var(--orange); border-color:var(--orange); }
     .notice { margin-top:12px; padding:10px 12px; border-left:3px solid var(--orange);
       background:#2a2118; color:#ffd7a1; border-radius:6px; }
-    #log { height:480px; margin:0; overflow:auto; white-space:pre-wrap; word-break:break-word;
+    #log { height:420px; margin:0; overflow:auto; white-space:pre-wrap; word-break:break-word;
       padding:12px; background:#070b14; color:#c8d4ec; font:12px/1.45 ui-monospace,monospace; }
-    .config-sections { max-height:calc(100vh - 180px); overflow:auto; padding:12px; }
+    .config-sections { max-height:min(680px,calc(100vh - 180px)); overflow:auto; padding:12px; }
     details { background:#10172a; border:1px solid var(--line); border-radius:10px; margin-bottom:9px; }
     summary { padding:11px 13px; cursor:pointer; font-weight:700; color:#cfe4ff; }
     .fields { padding:0 12px 12px; display:grid; gap:10px; }
@@ -438,8 +462,30 @@ INDEX_HTML = r"""<!doctype html>
     .small { font-size:12px; color:var(--muted); }
     .action { min-height:20px; margin-top:10px; color:#b9cdf1; font-weight:600; }
     .error { color:#ff9aaa; }
+    .telemetry-panel { grid-column:1/-1; }
+    .plot-toolbar { display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+    .plot-toolbar select { border:1px solid #344463; background:#090f1d; color:var(--text);
+      border-radius:7px; padding:7px 9px; }
+    .telemetry-note { padding:11px 16px; color:var(--muted); border-bottom:1px solid var(--line); }
+    .force-plots { display:grid; grid-template-columns:1fr; gap:12px;
+      padding:14px 14px 7px; }
+    .summary-plots { display:grid; grid-template-columns:repeat(2,minmax(360px,1fr)); gap:12px;
+      padding:7px 14px; }
+    .joint-plots { display:grid; grid-template-columns:repeat(3,minmax(280px,1fr)); gap:12px;
+      padding:7px 14px 14px; }
+    .plot-card { background:#090f1d; border:1px solid #2b3957; border-radius:10px; overflow:hidden; }
+    .plot-card.important { border-color:#8a6334; box-shadow:inset 0 0 0 1px #5a4025; }
+    .plot-title { display:flex; justify-content:space-between; gap:8px; align-items:baseline;
+      padding:9px 11px 4px; font-weight:700; color:#dce9ff; }
+    .plot-latest { color:var(--orange); font:12px ui-monospace,monospace; }
+    .plot-legend { min-height:28px; display:flex; flex-wrap:wrap; gap:4px 10px; padding:0 11px 5px;
+      color:var(--muted); font:11px ui-monospace,monospace; }
+    .legend-item::before { content:'—'; color:var(--series-color); font-weight:900; margin-right:3px; }
+    .plot-card canvas { display:block; width:100%; height:210px; background:#070b14; }
+    .force-plots .plot-card { border-color:#427bb2; box-shadow:inset 0 0 0 1px #294f77; }
+    .force-plots .plot-card canvas { height:320px; }
     @media (max-width:980px) { .layout{grid-template-columns:1fr}.config-sections{max-height:none}
-      .field{grid-template-columns:1fr} }
+      .field{grid-template-columns:1fr}.force-plots,.summary-plots,.joint-plots{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -457,7 +503,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="panel-head"><h2>Run Control</h2><span id="pidText" class="small"></span></div>
       <div class="panel-body">
         <div class="control-grid">
-          <button id="startBtn" class="primary">Start Teleoperation</button>
+          <button id="startBtn" class="primary">Start Unified Teleoperation</button>
           <button id="stopBtn" class="stop" disabled>Stop (Ctrl-C)</button>
           <button id="clearBtn">Clear Log View</button>
         </div>
@@ -487,6 +533,7 @@ INDEX_HTML = r"""<!doctype html>
             I confirm that the robot workspace is clear, the active Tool is correct, and the emergency stop is within reach.
           </label>
           <div style="margin-top:6px">If the clutch is pressed while switching modes, release it and press it again to enable motion.</div>
+          <div style="margin-top:6px">Mode 3: establish a light same-direction contact on a non-human test surface before pressing the clutch. The Tool-Z force ramps gently after contact is detected.</div>
         </div>
         <div id="runActionText" class="action"></div>
         <div id="errorText" class="error" style="margin-top:10px"></div>
@@ -497,6 +544,24 @@ INDEX_HTML = r"""<!doctype html>
       <pre id="log"></pre>
     </section>
   </div>
+  <section class="panel telemetry-panel" data-plot-count="14">
+    <div class="panel-head">
+      <div><h2 style="margin:0">Real-Time Tracking Plots</h2><div class="small">14 plots · large Mode 3 force chart · physical probe TCP · actual vs planned · joint tracking</div></div>
+      <div class="plot-toolbar">
+        <span id="telemetryState" class="small">Waiting for telemetry</span>
+        <label class="small">Window
+          <select id="plotWindow"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option></select>
+        </label>
+        <button id="clearPlotsBtn">Clear Plots</button>
+      </div>
+    </div>
+    <div class="telemetry-note">
+      Mode 3 force: measured = configured Flexiv wrench projected onto live probe Z; estimated = the low-pass value used by the controller (not an independent Bota ground truth). J1–J7 error = Flexiv null-space reference − measured joint angle. J8–J9 error = commanded wrist position − measured angle. Position and orientation errors are direct physical probe TCP task errors.
+    </div>
+    <div id="forcePlots" class="force-plots"></div>
+    <div id="summaryPlots" class="summary-plots"></div>
+    <div id="jointPlots" class="joint-plots"></div>
+  </section>
 </main>
 <script>
 const TOKEN = __TOKEN__;
@@ -506,6 +571,105 @@ let lastSequence = 0;
 let dirty = false;
 let renderingConfig = false;
 let startBusy = false;
+let lastTelemetrySequence = 0;
+let telemetryHistory = [];
+let plotWindowSeconds = 30;
+
+const COLORS = {x:'#ff667a',y:'#45d483',z:'#53a8ff',norm:'#ffb454',actual:'#9bc7ff',target:'#f6c86b'};
+const axisNames = ['X','Y','Z'];
+const plotDefinitions = [
+  {id:'mode3Force',group:'force',height:320,title:'Mode 3 Tool-Z Force — Real-Time Measured vs Estimated',unit:'N',important:true,
+    emptyMessage:'Mode 3 force data appears after Mode 3 is selected',
+    headline:s=>s.mode==='pivot_orientation'?`measured ${s.force_measured_tool_z_n.toFixed(2)} N · estimated ${s.force_estimated_tool_z_n.toFixed(2)} N · ${s.force_control_active?'force axis active':'position hold'}`:'Mode 3 inactive',series:[
+      {label:'real-time measured',color:'#ffffff',value:s=>s.mode==='pivot_orientation'?s.force_measured_tool_z_n:NaN},
+      {label:'controller estimate (LPF)',color:COLORS.z,value:s=>s.mode==='pivot_orientation'?s.force_estimated_tool_z_n:NaN},
+      {label:'target sensed force',color:'#45d483',dash:true,value:s=>s.mode==='pivot_orientation'?s.force_target_tool_z_n:NaN},
+      {label:'ramped command',color:COLORS.norm,dash:true,value:s=>s.mode==='pivot_orientation'?s.force_command_tool_z_n:NaN}]},
+  {id:'tcpPosition',group:'summary',title:'TCP Position — Actual vs Planned',unit:'mm',series:[
+    ...axisNames.map((name,i)=>({label:`${name} actual`,color:[COLORS.x,COLORS.y,COLORS.z][i],value:s=>s.position_actual_m[i]*1000})),
+    ...axisNames.map((name,i)=>({label:`${name} planned`,color:[COLORS.x,COLORS.y,COLORS.z][i],dash:true,value:s=>s.position_target_m[i]*1000}))]},
+  {id:'tcpOrientation',group:'summary',title:'TCP Orientation — Actual vs Planned',unit:'deg rotvec',series:[
+    ...axisNames.map((name,i)=>({label:`R${name} actual`,color:[COLORS.x,COLORS.y,COLORS.z][i],value:s=>s.orientation_actual_rotvec_deg[i]})),
+    ...axisNames.map((name,i)=>({label:`R${name} planned`,color:[COLORS.x,COLORS.y,COLORS.z][i],dash:true,value:s=>s.orientation_target_rotvec_deg[i]}))]},
+  {id:'positionError',group:'summary',title:'TCP Position Error',unit:'mm',important:true,symmetric:true,headline:s=>`${s.position_error_norm_mm.toFixed(2)} mm norm`,series:[
+    ...axisNames.map((name,i)=>({label:`e${name}`,color:[COLORS.x,COLORS.y,COLORS.z][i],value:s=>s.position_error_mm[i]})),
+    {label:'norm',color:COLORS.norm,value:s=>s.position_error_norm_mm}]},
+  {id:'orientationError',group:'summary',title:'TCP Orientation Error',unit:'deg',important:true,symmetric:true,headline:s=>`${s.orientation_error_norm_deg.toFixed(2)}° norm`,series:[
+    ...axisNames.map((name,i)=>({label:`eR${name}`,color:[COLORS.x,COLORS.y,COLORS.z][i],value:s=>s.orientation_error_rotvec_deg[i]})),
+    {label:'norm',color:COLORS.norm,value:s=>s.orientation_error_norm_deg}]},
+  ...Array.from({length:9},(_,i)=>({id:`jointError${i+1}`,group:'joint',title:`Joint ${i+1} Error`,unit:'deg',symmetric:true,
+    headline:s=>`${s.joint_error_deg[i].toFixed(2)}°`,series:[{label:`q${i+1} target − actual`,color:i<7?COLORS.actual:COLORS.target,value:s=>s.joint_error_deg[i]}]}))
+];
+
+function initializePlots() {
+  const force=document.getElementById('forcePlots'); const summary=document.getElementById('summaryPlots'); const joints=document.getElementById('jointPlots');
+  plotDefinitions.forEach((definition,index)=>{
+    const card=document.createElement('div'); card.className='plot-card'+(definition.important?' important':''); card.dataset.plot=definition.id;
+    const title=document.createElement('div'); title.className='plot-title';
+    const label=document.createElement('span'); label.textContent=definition.title;
+    const latest=document.createElement('span'); latest.className='plot-latest'; latest.textContent='—';
+    title.append(label,latest);
+    const legend=document.createElement('div'); legend.className='plot-legend';
+    definition.series.forEach(series=>{const item=document.createElement('span');item.className='legend-item';item.style.setProperty('--series-color',series.color);item.textContent=series.label;legend.appendChild(item);});
+    const canvas=document.createElement('canvas'); canvas.setAttribute('aria-label',definition.title);
+    card.append(title,legend,canvas);
+    (definition.group==='force'?force:(definition.group==='summary'?summary:joints)).appendChild(card);
+  });
+  renderPlots();
+}
+
+function clearPlotHistory() {
+  telemetryHistory=[];
+  document.getElementById('telemetryState').textContent='Waiting for telemetry';
+  renderPlots();
+}
+
+function ingestTelemetry(items) {
+  for(const item of items || []) {
+    const sample=item.sample;
+    if(!sample || !Number.isFinite(sample.timestamp_s)) continue;
+    const previous=telemetryHistory[telemetryHistory.length-1];
+    if(previous && sample.timestamp_s+0.5<previous.timestamp_s) telemetryHistory=[];
+    telemetryHistory.push(sample);
+  }
+  if(telemetryHistory.length) {
+    const newest=telemetryHistory[telemetryHistory.length-1];
+    const cutoff=newest.timestamp_s-65;
+    telemetryHistory=telemetryHistory.filter(sample=>sample.timestamp_s>=cutoff);
+    document.getElementById('telemetryState').textContent=`${newest.mode} · ${newest.enabled?'enabled':'holding'} · ${newest.timestamp_s.toFixed(1)} s`;
+  }
+}
+
+function drawPlot(definition,card,samples) {
+  const canvas=card.querySelector('canvas'); const latest=card.querySelector('.plot-latest');
+  const width=Math.max(300,canvas.clientWidth); const height=definition.height||210; const ratio=window.devicePixelRatio||1;
+  if(canvas.width!==Math.round(width*ratio)||canvas.height!==Math.round(height*ratio)){canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);}
+  const context=canvas.getContext('2d'); context.setTransform(ratio,0,0,ratio,0,0); context.clearRect(0,0,width,height); context.fillStyle='#070b14';context.fillRect(0,0,width,height);
+  const left=54,right=12,top=12,bottom=27,plotWidth=width-left-right,plotHeight=height-top-bottom;
+  if(!samples.length){context.fillStyle='#6f7e9c';context.font='12px system-ui';context.textAlign='center';context.fillText('Waiting for teleoperation telemetry',width/2,height/2);latest.textContent='—';return;}
+  const newest=samples[samples.length-1]; const endTime=newest.timestamp_s; const startTime=endTime-plotWindowSeconds;
+  const visible=samples.filter(sample=>sample.timestamp_s>=startTime);
+  const values=[];
+  definition.series.forEach(series=>visible.forEach(sample=>{const value=series.value(sample);if(Number.isFinite(value))values.push(value);}));
+  if(!values.length){context.fillStyle='#6f7e9c';context.font='12px system-ui';context.textAlign='center';context.fillText(definition.emptyMessage||'No finite telemetry in this time window',width/2,height/2);latest.textContent='—';return;}
+  let minimum=Math.min(...values),maximum=Math.max(...values);
+  if(definition.symmetric){const bound=Math.max(Math.abs(minimum),Math.abs(maximum),definition.unit==='deg'?0.1:0.01);minimum=-bound;maximum=bound;}
+  else {let padding=(maximum-minimum)*0.12;if(padding<1e-6)padding=Math.max(Math.abs(maximum)*0.02,0.01);minimum-=padding;maximum+=padding;}
+  const ySpan=Math.max(maximum-minimum,1e-9); const xFor=t=>left+(t-startTime)/plotWindowSeconds*plotWidth; const yFor=value=>top+(maximum-value)/ySpan*plotHeight;
+  context.lineWidth=1;context.font='10px ui-monospace,monospace';context.textAlign='right';context.textBaseline='middle';
+  for(let index=0;index<=4;index++){const y=top+index*plotHeight/4;const value=maximum-index*ySpan/4;context.strokeStyle='#1c2740';context.beginPath();context.moveTo(left,y);context.lineTo(width-right,y);context.stroke();context.fillStyle='#7887a6';context.fillText(value.toFixed(Math.abs(value)<10?2:1),left-6,y);}
+  context.textAlign='center';context.textBaseline='top';
+  for(let index=0;index<=3;index++){const x=left+index*plotWidth/3;context.strokeStyle='#141e33';context.beginPath();context.moveTo(x,top);context.lineTo(x,height-bottom);context.stroke();context.fillStyle='#7887a6';context.fillText(`${(-plotWindowSeconds+index*plotWindowSeconds/3).toFixed(0)}s`,x,height-bottom+6);}
+  context.save();context.translate(11,top+plotHeight/2);context.rotate(-Math.PI/2);context.fillStyle='#95a3c2';context.textAlign='center';context.textBaseline='top';context.fillText(definition.unit,0,0);context.restore();
+  definition.series.forEach(series=>{context.strokeStyle=series.color;context.lineWidth=series.dash?1.3:1.8;context.setLineDash(series.dash?[5,4]:[]);context.beginPath();let started=false;visible.forEach(sample=>{const value=series.value(sample);if(!Number.isFinite(value))return;const x=xFor(sample.timestamp_s),y=yFor(value);if(!started){context.moveTo(x,y);started=true;}else context.lineTo(x,y);});if(started)context.stroke();});context.setLineDash([]);
+  latest.textContent=definition.headline?definition.headline(newest):definition.series.slice(0,3).map(series=>`${series.label} ${series.value(newest).toFixed(2)}`).join(' · ');
+}
+
+function renderPlots() {
+  const end=telemetryHistory.length?telemetryHistory[telemetryHistory.length-1].timestamp_s:0;
+  const samples=telemetryHistory.filter(sample=>sample.timestamp_s>=end-plotWindowSeconds);
+  plotDefinitions.forEach(definition=>{const card=document.querySelector(`[data-plot="${definition.id}"]`);if(card)drawPlot(definition,card,samples);});
+}
 
 async function api(path, options={}) {
   const headers = Object.assign({'X-Teleop-Token': TOKEN}, options.headers || {});
@@ -521,7 +685,7 @@ async function api(path, options={}) {
 function sectionTitle(name) {
   const titles={robot:'Flexiv Arm',haptic:'omega.7 Haptic Device',pedal:'Foot Pedals',wrist:'Wrist Motors',motor_pid:'Motor PID',demo:'Demo Trajectory',
     wrist_geometry:'Wrist Geometry',wrist_payload:'Wrist Payload',flexiv_tool:'Flexiv Tool',allocation:'9-DoF Allocation',
-    osc_controller:'Torque OSC Controller',pivot_orientation_osc:'Mode 3 OSC',force_feedback:'Haptic Feedback',runtime:'Real-Motion Confirmation'};
+    osc_controller:'Torque OSC Controller',teleop_impedance:'Flexiv Impedance + Unified Mode 3',teleop_osc:'Experimental Torque OSC',pivot_orientation_osc:'Mode 3 Hybrid OSC',force_feedback:'Haptic Feedback',runtime:'Real-Motion Confirmation'};
   return `${titles[name] || name}  [${name}]`;
 }
 
@@ -590,6 +754,7 @@ async function startTask(task='teleop') {
   if(!acknowledgement.checked){errorText.textContent='Check the safety confirmation before starting.';action.textContent='Start cancelled.';return;}
   startBusy=true; updateStartButton(false); errorText.textContent='';
   try {
+    clearPlotHistory();
     action.textContent='Saving and validating configuration…';
     await saveConfig();
     action.textContent=`Starting ${task}…`;
@@ -615,17 +780,23 @@ function updateStatus(state) {
   document.querySelectorAll('.mode').forEach(button=>{button.disabled=!running || state.task!=='teleop';button.classList.toggle('active',state.mode===({1:'7dof',2:'9dof',3:'pivot_orientation'})[button.dataset.mode]);});
   if(state.last_error) document.getElementById('errorText').textContent=state.last_error;
   if(state.logs && state.logs.length){const log=document.getElementById('log'); log.textContent+=state.logs.map(item=>item.line).join('\n')+'\n'; if(log.textContent.length>400000)log.textContent=log.textContent.slice(-300000); if(document.getElementById('autoScroll').checked)log.scrollTop=log.scrollHeight; lastSequence=state.last_sequence;}
+  if(state.telemetry && state.telemetry.length){ingestTelemetry(state.telemetry);renderPlots();}
+  if(Number.isInteger(state.last_telemetry_sequence))lastTelemetrySequence=state.last_telemetry_sequence;
 }
 
-async function poll(){try{updateStatus(await api(`/api/status?since=${lastSequence}`));}catch(error){document.getElementById('errorText').textContent=error.message;}finally{setTimeout(poll,300);}}
+async function poll(){try{updateStatus(await api(`/api/status?since=${lastSequence}&telemetry_since=${lastTelemetrySequence}`));}catch(error){document.getElementById('errorText').textContent=error.message;}finally{setTimeout(poll,300);}}
 document.getElementById('saveBtn').addEventListener('click',()=>saveConfig().catch(e=>document.getElementById('errorText').textContent=e.message));
 document.getElementById('reloadBtn').addEventListener('click',()=>{if(!dirty||confirm('Discard unsaved changes?'))loadConfig().catch(e=>document.getElementById('errorText').textContent=e.message);});
 document.getElementById('startBtn').addEventListener('click',()=>startTask('teleop'));
 document.querySelectorAll('.task').forEach(button=>button.addEventListener('click',()=>startTask(button.dataset.task)));
 document.getElementById('stopBtn').addEventListener('click',stopTeleop);
 document.getElementById('clearBtn').addEventListener('click',()=>document.getElementById('log').textContent='');
+document.getElementById('clearPlotsBtn').addEventListener('click',clearPlotHistory);
+document.getElementById('plotWindow').addEventListener('change',event=>{plotWindowSeconds=Number(event.target.value);renderPlots();});
 document.querySelectorAll('.mode').forEach(button=>button.addEventListener('click',()=>selectMode(button.dataset.mode)));
 window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue='';}});
+window.addEventListener('resize',renderPlots);
+initializePlots();
 loadConfig().then(poll).catch(error=>document.getElementById('errorText').textContent=error.message);
 </script>
 </body>
@@ -682,8 +853,16 @@ def make_handler(
                 if parsed.path == "/api/config":
                     self._json(store.read())
                 elif parsed.path == "/api/status":
-                    since = int(parse_qs(parsed.query).get("since", ["0"])[0])
-                    self._json(manager.status(max(0, since)))
+                    query = parse_qs(parsed.query)
+                    since = int(query.get("since", ["0"])[0])
+                    telemetry_since = int(
+                        query.get("telemetry_since", ["0"])[0]
+                    )
+                    self._json(
+                        manager.status(
+                            max(0, since), max(0, telemetry_since)
+                        )
+                    )
                 else:
                     self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             except Exception as error:

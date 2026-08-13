@@ -102,6 +102,121 @@ class PedalModeStateMachine:
     def teleoperation_enabled(self, clutch_pressed: bool) -> bool:
         return self.selected_mode is not None and self.ready and clutch_pressed
 
+    def clear(self) -> ModeTransition:
+        """Return to a disabled, no-mode-selected state."""
+        changed = self.selected_mode is not None or self.ready
+        self.selected_mode = None
+        self.ready = False
+        self._waiting_for_release = False
+        return ModeTransition(None, False, changed, "mode_cleared")
+
+
+@dataclass(frozen=True)
+class Mode3ForceGateResult:
+    """One update of the Mode-3 contact gate and force ramp."""
+
+    force_axis_enabled: bool
+    commanded_force_n: float
+    changed: bool
+    reason: str
+
+
+class Mode3ForceGate:
+    """Gate and gently ramp the Mode-3 Tool-Z force command.
+
+    The force-controlled axis is never enabled in free space.  Contact must
+    first be measured in the configured target-force direction.  Once contact
+    is present, the command starts at the measured force and ramps to the
+    requested task force.  A short, configurable loss-of-contact delay avoids
+    chattering on sensor noise; a genuine loss returns the axis to position
+    control without terminating teleoperation.
+    """
+
+    def __init__(
+        self,
+        *,
+        target_force_n: float,
+        contact_enable_threshold_n: float,
+        contact_release_threshold_n: float,
+        contact_release_delay_s: float,
+        force_ramp_s: float,
+    ) -> None:
+        values = (
+            target_force_n,
+            contact_enable_threshold_n,
+            contact_release_threshold_n,
+            contact_release_delay_s,
+            force_ramp_s,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Mode3 force-gate settings must be finite")
+        if target_force_n == 0.0:
+            raise ValueError("target_force_n must be nonzero")
+        if contact_enable_threshold_n <= 0.0:
+            raise ValueError("contact_enable_threshold_n must be positive")
+        if not 0.0 <= contact_release_threshold_n < contact_enable_threshold_n:
+            raise ValueError("release threshold must be in [0, enable threshold)")
+        if contact_release_delay_s <= 0.0 or force_ramp_s <= 0.0:
+            raise ValueError("release delay and force ramp must be positive")
+        self.target_force_n = float(target_force_n)
+        self.contact_enable_threshold_n = float(contact_enable_threshold_n)
+        self.contact_release_threshold_n = float(contact_release_threshold_n)
+        self.contact_release_delay_s = float(contact_release_delay_s)
+        self.force_ramp_s = float(force_ramp_s)
+        self._direction = math.copysign(1.0, self.target_force_n)
+        self.reset()
+
+    def reset(self) -> None:
+        self._active = False
+        self._ramp_started_s: float | None = None
+        self._ramp_start_magnitude_n = 0.0
+        self._contact_lost_since_s: float | None = None
+
+    def update(
+        self, measured_force_n: float, *, teleoperation_enabled: bool, now_s: float
+    ) -> Mode3ForceGateResult:
+        if not math.isfinite(measured_force_n) or not math.isfinite(now_s):
+            raise ValueError("Mode3 force-gate inputs must be finite")
+        if not teleoperation_enabled:
+            changed = self._active
+            self.reset()
+            return Mode3ForceGateResult(False, 0.0, changed, "teleoperation_disabled")
+
+        aligned_magnitude = self._direction * measured_force_n
+        if not self._active:
+            if aligned_magnitude < self.contact_enable_threshold_n:
+                return Mode3ForceGateResult(False, 0.0, False, "waiting_for_contact")
+            self._active = True
+            self._ramp_started_s = now_s
+            self._ramp_start_magnitude_n = float(
+                np.clip(aligned_magnitude, 0.0, abs(self.target_force_n))
+            )
+            self._contact_lost_since_s = None
+            return Mode3ForceGateResult(
+                True,
+                self._direction * self._ramp_start_magnitude_n,
+                True,
+                "contact_acquired",
+            )
+
+        if aligned_magnitude < self.contact_release_threshold_n:
+            if self._contact_lost_since_s is None:
+                self._contact_lost_since_s = now_s
+            elif now_s - self._contact_lost_since_s >= self.contact_release_delay_s:
+                self.reset()
+                return Mode3ForceGateResult(False, 0.0, True, "contact_lost")
+        else:
+            self._contact_lost_since_s = None
+
+        assert self._ramp_started_s is not None
+        alpha = float(np.clip((now_s - self._ramp_started_s) / self.force_ramp_s, 0.0, 1.0))
+        magnitude = self._ramp_start_magnitude_n + alpha * (
+            abs(self.target_force_n) - self._ramp_start_magnitude_n
+        )
+        return Mode3ForceGateResult(
+            True, self._direction * magnitude, False, "contact_active"
+        )
+
 
 def _as_vector(values: np.ndarray, length: int, name: str) -> np.ndarray:
     result = np.asarray(values, dtype=float)
@@ -296,6 +411,32 @@ def flange_target_for_probe(
     if target.shape != (4, 4):
         raise ValueError("probe_target_world must be a pose or 4x4 transform")
     return target @ np.linalg.inv(geometry.forward(wrist_q_rad))
+
+
+def flange_target_for_probe_decoupled(
+    probe_target_world: np.ndarray,
+    geometry: WristGeometry,
+    wrist_orientation_q_rad: np.ndarray,
+    wrist_position_q_rad: np.ndarray,
+) -> np.ndarray:
+    """Keep live TCP position while assigning reachable rotation to q8/q9.
+
+    The desired wrist angle determines only the residual flange orientation.
+    The measured wrist angle determines the translation needed to cancel the
+    live offset-tip arc. Thus a slow wrist cannot make the arm temporarily
+    perform its reachable rotation, while TCP position remains exact.
+    """
+    target = np.asarray(probe_target_world, dtype=float)
+    if target.shape == (7,):
+        target = pose_to_transform(target)
+    if target.shape != (4, 4) or not np.all(np.isfinite(target)):
+        raise ValueError("probe_target_world must be a finite pose or 4x4 transform")
+    wrist_orientation = geometry.forward(wrist_orientation_q_rad)
+    wrist_position = geometry.forward(wrist_position_q_rad)
+    result = np.eye(4)
+    result[:3, :3] = target[:3, :3] @ wrist_orientation[:3, :3].T
+    result[:3, 3] = target[:3, 3] - result[:3, :3] @ wrist_position[:3, 3]
+    return result
 
 
 def probe_pose_from_flange(

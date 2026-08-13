@@ -505,6 +505,127 @@ inline OscResult OperationalSpaceTorque(const Eigen::MatrixXd& mass,
         task_error};
 }
 
+// Strict two-level OSC used by contact reorientation:
+//   1. Cartesian position is the primary task.
+//   2. Orientation and posture are projected into the dynamically consistent
+//      null space of position, so they cannot intentionally trade fixed-point
+//      accuracy for a smaller orientation error.
+// This differs from a single weighted 6D impedance: increasing orientation
+// demand cannot steal authority from the captured XYZ point.
+inline OscResult PositionPriorityOperationalSpaceTorque(
+    const Eigen::MatrixXd& mass, const Eigen::MatrixXd& position_jacobian,
+    const Eigen::MatrixXd& orientation_jacobian,
+    const Eigen::Vector3d& position_error,
+    const Eigen::Vector3d& position_velocity_error,
+    const Eigen::Vector3d& orientation_error,
+    const Eigen::Vector3d& orientation_velocity_error,
+    const Eigen::VectorXd& null_error,
+    const Eigen::VectorXd& joint_velocity, double kp_position,
+    double kd_position, double kp_orientation, double kd_orientation,
+    double kp_null, double kd_null, double damping,
+    double orientation_scale = 1.0)
+{
+    const int dof = static_cast<int>(mass.rows());
+    if (mass.cols() != dof || position_jacobian.rows() != 3
+        || position_jacobian.cols() != dof
+        || orientation_jacobian.rows() != 3
+        || orientation_jacobian.cols() != dof
+        || null_error.size() != dof || joint_velocity.size() != dof
+        || damping < 0.0 || orientation_scale < 0.0
+        || orientation_scale > 1.0) {
+        throw std::invalid_argument(
+            "position-priority OSC dimensions/parameters are inconsistent");
+    }
+    Eigen::LDLT<Eigen::MatrixXd> mass_solver(mass);
+    if (mass_solver.info() != Eigen::Success) {
+        throw std::runtime_error(
+            "position-priority joint mass factorization failed");
+    }
+    const Eigen::MatrixXd minv_position_jt
+        = mass_solver.solve(position_jacobian.transpose());
+    const Eigen::Matrix3d undamped_inverse_position_lambda
+        = position_jacobian * minv_position_jt;
+    Eigen::Matrix3d inverse_position_lambda
+        = undamped_inverse_position_lambda;
+    inverse_position_lambda.diagonal().array() += damping * damping;
+    Eigen::LDLT<Eigen::Matrix3d> position_solver(inverse_position_lambda);
+    if (position_solver.info() != Eigen::Success) {
+        throw std::runtime_error(
+            "position-priority position inertia factorization failed");
+    }
+    const Eigen::Matrix3d position_lambda
+        = position_solver.solve(Eigen::Matrix3d::Identity());
+    // Use an effectively undamped inverse only for the hierarchy projector.
+    // Task damping remains in position_lambda above. Reusing the damped task
+    // inverse in the projector would allow secondary orientation torque to
+    // leak back into primary TCP acceleration.
+    Eigen::Matrix3d projector_inverse_position_lambda
+        = undamped_inverse_position_lambda;
+    projector_inverse_position_lambda.diagonal().array() += 1e-10;
+    Eigen::LDLT<Eigen::Matrix3d> projector_position_solver(
+        projector_inverse_position_lambda);
+    if (projector_position_solver.info() != Eigen::Success) {
+        throw std::runtime_error(
+            "position-priority projector factorization failed");
+    }
+    const Eigen::Matrix3d projector_position_lambda
+        = projector_position_solver.solve(Eigen::Matrix3d::Identity());
+    const Eigen::MatrixXd position_jbar
+        = minv_position_jt * projector_position_lambda;
+    const Eigen::MatrixXd position_null
+        = Eigen::MatrixXd::Identity(dof, dof)
+          - position_jbar * position_jacobian;
+
+    const Eigen::Vector3d position_acceleration
+        = kp_position * position_error
+          + kd_position * position_velocity_error;
+    Eigen::VectorXd torque = position_jacobian.transpose()
+                             * position_lambda * position_acceleration;
+
+    // Project the flange-orientation Jacobian before solving its operational
+    // inertia. Its resulting torque is therefore already in the primary
+    // position task's torque null space.
+    const Eigen::MatrixXd projected_orientation_jacobian
+        = orientation_jacobian * position_null;
+    const Eigen::MatrixXd minv_orientation_jt
+        = mass_solver.solve(projected_orientation_jacobian.transpose());
+    Eigen::Matrix3d inverse_orientation_lambda
+        = projected_orientation_jacobian * minv_orientation_jt;
+    inverse_orientation_lambda.diagonal().array() += damping * damping;
+    Eigen::LDLT<Eigen::Matrix3d> orientation_solver(
+        inverse_orientation_lambda);
+    if (orientation_solver.info() != Eigen::Success) {
+        throw std::runtime_error(
+            "position-priority orientation inertia factorization failed");
+    }
+    const Eigen::Matrix3d orientation_lambda
+        = orientation_solver.solve(Eigen::Matrix3d::Identity());
+    const Eigen::Vector3d orientation_acceleration
+        = orientation_scale
+          * (kp_orientation * orientation_error
+              + kd_orientation * orientation_velocity_error);
+    torque += projected_orientation_jacobian.transpose()
+              * orientation_lambda * orientation_acceleration;
+
+    const Eigen::MatrixXd orientation_jbar
+        = minv_orientation_jt * orientation_lambda;
+    const Eigen::MatrixXd orientation_null
+        = Eigen::MatrixXd::Identity(dof, dof)
+          - orientation_jbar * projected_orientation_jacobian;
+    const Eigen::VectorXd posture_torque
+        = kp_null * null_error - kd_null * joint_velocity;
+    torque += position_null.transpose() * orientation_null.transpose()
+              * posture_torque;
+
+    Eigen::Matrix<double, 6, 6> lambda
+        = Eigen::Matrix<double, 6, 6>::Zero();
+    lambda.topLeftCorner<3, 3>() = position_lambda;
+    lambda.bottomRightCorner<3, 3>() = orientation_lambda;
+    Eigen::Matrix<double, 6, 1> combined_error;
+    combined_error << position_error, orientation_error;
+    return {torque, lambda, combined_error};
+}
+
 inline Eigen::VectorXd RateAndMagnitudeLimit(const Eigen::VectorXd& requested,
     const Eigen::VectorXd& previous, const Eigen::VectorXd& absolute_limit,
     const Eigen::VectorXd& rate_limit_nm_s)

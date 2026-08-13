@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from ui.control_panel import ANSI_ESCAPE_RE, INDEX_HTML, _primary_error
+from ui.control_panel import (
+    ANSI_ESCAPE_RE,
+    INDEX_HTML,
+    TeleopProcessManager,
+    _primary_error,
+)
 
 
 def test_specific_wrist_error_is_not_hidden_by_exit_wrapper() -> None:
@@ -26,3 +31,30 @@ def test_control_panel_exposes_primary_missions_and_tools() -> None:
         "identify-inertia", "dynamic-inertia", "apply-pid",
     ):
         assert f'data-task="{task}"' in INDEX_HTML
+
+
+def test_control_panel_declares_large_force_and_all_tracking_plots() -> None:
+    assert 'data-plot-count="14"' in INDEX_HTML
+    assert "Mode 3 Tool-Z Force — Real-Time Measured vs Estimated" in INDEX_HTML
+    assert "height:320" in INDEX_HTML
+    assert "TCP Position — Actual vs Planned" in INDEX_HTML
+    assert "TCP Orientation — Actual vs Planned" in INDEX_HTML
+    assert "TCP Position Error" in INDEX_HTML
+    assert "TCP Orientation Error" in INDEX_HTML
+    assert "Array.from({length:9}" in INDEX_HTML
+
+
+def test_process_manager_routes_structured_telemetry_out_of_live_log() -> None:
+    manager = TeleopProcessManager()
+    manager._append(
+        'TELEMETRY {"timestamp_s":1.0,"mode":"9dof","enabled":true}'
+    )
+    status = manager.status()
+    assert status["logs"] == []
+    assert status["last_telemetry_sequence"] == 1
+    assert status["telemetry"] == [
+        {
+            "sequence": 1,
+            "sample": {"timestamp_s": 1.0, "mode": "9dof", "enabled": True},
+        }
+    ]

@@ -179,6 +179,36 @@ def test_unlimited_translation_and_step_map_full_scaled_delta():
     assert np.allclose(target[:3], [0.16, -0.08, 0.04])
 
 
+def test_reclutch_recenters_device_and_accumulates_from_measured_robot_pose():
+    mapper = RelativePoseMapper(
+        MappingConfig(
+            translation_scale=2.0,
+            max_translation_m=None,
+            max_step_m=None,
+            enable_rotation=True,
+            max_rotation_rad=None,
+            max_angular_step_rad=None,
+        ),
+        np.eye(3),
+    )
+    initial_robot = np.array([0, 0, 0, 1, 0, 0, 0], dtype=float)
+    mapper.capture(sample(), initial_robot)
+    first = mapper.target(sample((0.04, 0.0, 0.0)))
+    np.testing.assert_allclose(first[:3], [0.08, 0.0, 0.0])
+
+    # Simulate release after the robot reached only 60 mm, move the haptic
+    # handle back while released, and engage again. The new command must start
+    # exactly at the measured robot pose, without an old-target jump.
+    measured_on_reclutch = np.array([0.06, 0, 0, 1, 0, 0, 0], dtype=float)
+    recentered_device = sample((-0.03, 0.0, 0.0))
+    mapper.capture(recentered_device, measured_on_reclutch)
+    np.testing.assert_allclose(
+        mapper.target(recentered_device), measured_on_reclutch, atol=1e-12
+    )
+    continued = mapper.target(sample((0.02, 0.0, 0.0)))
+    np.testing.assert_allclose(continued[:3], [0.16, 0.0, 0.0])
+
+
 def test_mapping_deadband_suppresses_feedback_micro_motion_continuously():
     mapper = RelativePoseMapper(
         MappingConfig(
@@ -282,6 +312,56 @@ def test_yaw_command_can_be_reversed_without_changing_pitch_axis():
     assert np.allclose(
         np.rad2deg(quaternion_to_rotation_vector(yaw_target[3:])),
         [0.0, 0.0, -10.0],
+        atol=1e-8,
+    )
+    mapper.capture(sample(), robot_pose)
+    opposite_yaw_target = mapper.target(
+        sample(rotation=rotation_vector_to_matrix(np.deg2rad([0.0, 0.0, -10.0])))
+    )
+    assert np.allclose(
+        np.rad2deg(quaternion_to_rotation_vector(opposite_yaw_target[3:])),
+        [0.0, 0.0, 10.0],
+        atol=1e-8,
+    )
+
+
+def test_rotation_mapping_uses_handle_local_frame_at_nonidentity_anchor():
+    mapper = RelativePoseMapper(
+        MappingConfig(
+            enable_rotation=True,
+            max_rotation_rad=None,
+            max_angular_step_rad=None,
+        ),
+        np.eye(3),
+        rotation_axis_map=np.eye(3),
+        rotation_command_sign=np.ones(3),
+    )
+    device_anchor = rotation_vector_to_matrix(
+        np.deg2rad([23.0, -17.0, 31.0])
+    )
+    robot_anchor_rotation = rotation_vector_to_matrix(
+        np.deg2rad([-35.0, 12.0, 8.0])
+    )
+    robot_pose = np.r_[
+        [0.4, -0.2, 0.5], matrix_to_quaternion(robot_anchor_rotation)
+    ]
+    mapper.capture(sample(rotation=device_anchor), robot_pose)
+
+    # Apply a +12 degree rotation about the handle's own local Y axis. The
+    # robot must receive +12 degrees about its captured local Y axis, with no
+    # start-attitude-dependent X/Z cross-coupling.
+    local_delta = rotation_vector_to_matrix(np.deg2rad([0.0, 12.0, 0.0]))
+    target = mapper.target(sample(rotation=device_anchor @ local_delta))
+    target_local_delta = (
+        robot_anchor_rotation.T @ quaternion_to_matrix(target[3:])
+    )
+    np.testing.assert_allclose(
+        np.rad2deg(
+            quaternion_to_rotation_vector(
+                matrix_to_quaternion(target_local_delta)
+            )
+        ),
+        [0.0, 12.0, 0.0],
         atol=1e-8,
     )
 

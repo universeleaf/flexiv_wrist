@@ -1,4 +1,5 @@
 #include "rt_osc_common.hpp"
+#include "teleop_shared_memory.hpp"
 #include "wrist_shared_memory.hpp"
 
 #include <flexiv/rdk/model.hpp>
@@ -7,6 +8,7 @@
 
 #include <limits>
 #include <map>
+#include <memory>
 #include <thread>
 
 using namespace flexiv;
@@ -36,7 +38,7 @@ struct WristModel {
     Eigen::Vector2d torque_bias {0.0, 0.0};
     double rigid_body_scale {1.0};
     double priority_inertia_scale {1.0};
-    double wrist_priority_gain {2.0};
+    double wrist_priority_gain {1.0};
     Eigen::Vector2d wrist_tracking_kp {3.0, 1.2};
     Eigen::Vector2d wrist_tracking_kd {0.8, 0.35};
     double wrist_target_filter_hz {1.5};
@@ -66,6 +68,52 @@ struct WristModel {
     Eigen::Matrix<double, 7, 1> arm_torque_slew {
         (Eigen::Matrix<double, 7, 1>() << 200.0, 200.0, 150.0, 150.0, 80.0, 80.0, 50.0).finished()};
     Eigen::Vector2d wrist_torque_slew {15.0, 8.0};
+    double teleop_target_filter_hz {8.0};
+    double teleop_max_linear_velocity_m_s {0.12};
+    double teleop_max_linear_acceleration_m_s2 {0.6};
+    double teleop_max_angular_velocity_rad_s {0.35};
+    double teleop_max_angular_acceleration_rad_s2 {1.2};
+    double teleop_arm_translation_kp {55.0};
+    double teleop_arm_translation_kd {20.0};
+    double teleop_arm_rotation_kp {18.0};
+    double teleop_arm_rotation_kd {9.0};
+    double mode2_arm_rotation_kp {18.0};
+    double mode2_arm_rotation_kd {8.0};
+    double mode2_arm_max_angular_velocity_rad_s {0.20};
+    double mode2_arm_max_angular_acceleration_rad_s2 {0.60};
+    double mode2_posture_reference_rate_per_s {0.0};
+    double teleop_wrist_target_filter_hz {4.0};
+    Eigen::Vector2d teleop_wrist_target_max_velocity_rad_s {
+        90.0 * kPi / 180.0, 150.0 * kPi / 180.0};
+    Eigen::Vector2d teleop_wrist_target_max_acceleration_rad_s2 {
+        360.0 * kPi / 180.0, 600.0 * kPi / 180.0};
+    double teleop_max_operational_damping {0.5};
+    double teleop_singularity_characteristic_length_m {0.25};
+    double teleop_singularity_slow_sigma {0.05};
+    double teleop_singularity_critical_sigma {0.015};
+    double teleop_singularity_min_motion_scale {0.15};
+    double teleop_posture_reference_rate_per_s {0.1};
+    double clutch_hold_natural_frequency_hz {1.0};
+    double clutch_hold_damping_ratio {1.25};
+    bool dynamic_wrist_gravity_compensation {true};
+    double dynamic_gravity_filter_hz {5.0};
+    double mode3_position_kp {160.0};
+    double mode3_position_kd {32.0};
+    double mode3_arm_rotation_kp {18.0};
+    double mode3_arm_rotation_kd {8.0};
+    double mode3_arm_max_angular_velocity_rad_s {0.20};
+    double mode3_arm_max_angular_acceleration_rad_s2 {0.60};
+    double mode3_contact_enable_threshold_n {2.0};
+    double mode3_contact_release_threshold_n {1.0};
+    double mode3_contact_release_delay_s {0.05};
+    double mode3_force_tolerance_n {1.0};
+    double mode3_force_full_position_error_m {0.001};
+    double mode3_force_disable_position_error_m {0.003};
+    double mode3_force_kp {0.25};
+    double mode3_force_ki_per_s {0.35};
+    double mode3_force_damping_n_s_m {25.0};
+    double mode3_force_integral_limit_n {8.0};
+    double mode3_force_command_limit_n {30.0};
 };
 
 struct WristKinematics {
@@ -176,6 +224,46 @@ Eigen::Matrix<double, 6, 9> BodyComJacobian(const Eigen::MatrixXd& flange_jacobi
     return result;
 }
 
+struct WristGravityResult {
+    Eigen::Matrix<double, 7, 1> arm_delta {Eigen::Matrix<double, 7, 1>::Zero()};
+    Eigen::Vector2d wrist {Eigen::Vector2d::Zero()};
+};
+
+WristGravityResult DynamicWristGravity(const WristModel& model,
+    const Eigen::Vector2d& q_wrist, const Eigen::MatrixXd& flange_jacobian,
+    const Eigen::Matrix3d& flange_rotation)
+{
+    // Flexiv's internal gravity model already contains the Elements Tool as a
+    // rigid body at q8=q9=0.  Compute the full generalized gravity compensation
+    // of the articulated two-body wrist, then send only live-minus-zero to the
+    // seven Flexiv joints.  The two external joints are absent from the Flexiv
+    // model, so they receive their complete live gravity vector.
+    const auto generalized = [&](const Eigen::Vector2d& q)
+        -> Eigen::Matrix<double, 9, 1> {
+        const WristKinematics wrist = EvaluateWrist(model, q);
+        const auto j1 = BodyComJacobian(flange_jacobian, flange_rotation,
+            wrist.link1_com_position_flange, wrist.link1_linear_jacobian,
+            wrist.link1_angular_jacobian);
+        const auto j2 = BodyComJacobian(flange_jacobian, flange_rotation,
+            wrist.link2_com_position_flange, wrist.link2_linear_jacobian,
+            wrist.link2_angular_jacobian);
+        const Eigen::Vector3d gravity_world(0.0, 0.0, -9.80665);
+        return (-model.rigid_body_scale
+                * (j1.topRows<3>().transpose()
+                       * (model.mass1 * gravity_world)
+                    + j2.topRows<3>().transpose()
+                          * (model.mass2 * gravity_world)))
+            .eval();
+    };
+    const Eigen::Matrix<double, 9, 1> live = generalized(q_wrist);
+    const Eigen::Matrix<double, 9, 1> zero
+        = generalized(Eigen::Vector2d::Zero());
+    WristGravityResult result;
+    result.arm_delta = live.head<7>() - zero.head<7>();
+    result.wrist = live.tail<2>();
+    return result;
+}
+
 Eigen::Matrix<double, 9, 9> MovingWristRigidBodyMass(const WristModel& model,
     const Eigen::Vector2d& q, const Eigen::MatrixXd& flange_jacobian,
     const Eigen::Matrix3d& flange_rotation)
@@ -237,19 +325,22 @@ double SymmetricConditionNumber(const Eigen::MatrixXd& matrix)
 }
 
 double AutomaticOperationalDamping(const Eigen::MatrixXd& mass,
-    const Eigen::MatrixXd& jacobian)
+    const Eigen::MatrixXd& jacobian, double maximum_damping = 0.20)
 {
+    if (maximum_damping < 0.01) {
+        throw std::invalid_argument("maximum operational damping is too small");
+    }
     Eigen::LDLT<Eigen::MatrixXd> mass_solver(mass);
     if (mass_solver.info() != Eigen::Success) {
         throw std::runtime_error("cannot factor auto coupled M(q)");
     }
-    Eigen::Matrix<double, 6, 6> inverse_lambda
+    Eigen::MatrixXd inverse_lambda
         = jacobian * mass_solver.solve(jacobian.transpose());
     inverse_lambda = 0.5 * (inverse_lambda + inverse_lambda.transpose());
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(
         inverse_lambda, Eigen::EigenvaluesOnly);
     if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("cannot inspect 6x6 operational inertia");
+        throw std::runtime_error("cannot inspect operational inertia");
     }
     const double minimum = std::max(0.0, solver.eigenvalues().minCoeff());
     const double maximum = solver.eigenvalues().maxCoeff();
@@ -257,7 +348,51 @@ double AutomaticOperationalDamping(const Eigen::MatrixXd& mass,
     const double required_squared
         = std::max(0.0,
             (maximum - target_condition * minimum) / (target_condition - 1.0));
-    return std::clamp(std::sqrt(required_squared), 0.01, 0.20);
+    return std::clamp(std::sqrt(required_squared), 0.01, maximum_damping);
+}
+
+struct ArmSingularityStatus {
+    double sigma_min {0.0};
+    double condition {std::numeric_limits<double>::infinity()};
+    double motion_scale {1.0};
+};
+
+ArmSingularityStatus EvaluateArmSingularity(
+    const Eigen::Matrix<double, 6, 7>& jacobian,
+    double characteristic_length_m, double slow_sigma,
+    double critical_sigma, double minimum_motion_scale)
+{
+    // Translation has units of metres/radian whereas orientation has units
+    // of radian/radian. Scale the angular rows by one physical arm length so
+    // the singular values are meaningful and independent of unit choice.
+    Eigen::Matrix<double, 6, 7> normalized = jacobian;
+    normalized.bottomRows<3>() *= characteristic_length_m;
+    const Eigen::Matrix<double, 6, 6> gram
+        = normalized * normalized.transpose();
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
+        0.5 * (gram + gram.transpose()), Eigen::EigenvaluesOnly);
+    if (solver.info() != Eigen::Success) {
+        return {0.0, std::numeric_limits<double>::infinity(),
+            minimum_motion_scale};
+    }
+    const double minimum_eigenvalue
+        = std::max(0.0, solver.eigenvalues().minCoeff());
+    const double maximum_eigenvalue
+        = std::max(0.0, solver.eigenvalues().maxCoeff());
+    const double sigma_min = std::sqrt(minimum_eigenvalue);
+    const double sigma_max = std::sqrt(maximum_eigenvalue);
+    const double condition = sigma_max / std::max(sigma_min, 1e-9);
+    const double normalized_margin = std::clamp(
+        (sigma_min - critical_sigma) / (slow_sigma - critical_sigma),
+        0.0, 1.0);
+    // C1-continuous slowdown: it never terminates the mission and retains a
+    // small command authority so the operator can reclutch and move away.
+    const double smooth
+        = normalized_margin * normalized_margin
+          * (3.0 - 2.0 * normalized_margin);
+    const double motion_scale
+        = minimum_motion_scale + (1.0 - minimum_motion_scale) * smooth;
+    return {sigma_min, condition, motion_scale};
 }
 
 Eigen::Vector2d SolveWristOrientationTarget(const WristModel& model,
@@ -318,6 +453,7 @@ Eigen::Vector2d WristCoriolis(const WristModel& model,
 struct Options {
     std::string robot_sn {"Rizon4s-062232"};
     std::string shared_memory;
+    std::string teleop_shared_memory;
     std::string model_config;
     std::string dry_run_csv {"/tmp/flexiv_9dof_osc_loop.csv"};
     std::string trajectory {"orientation"};
@@ -333,6 +469,7 @@ struct Options {
     std::string wrist_execution_mode {"hybrid_position_ff"};
     double wrist_state_timeout_ms {250.0};
     double wrist_hard_timeout_ms {2000.0};
+    double teleop_command_timeout_ms {500.0};
     bool real {false};
     int cpu_affinity {2};
 };
@@ -350,6 +487,7 @@ Options Parse(int argc, char** argv)
         };
         if (arg == "--robot-sn") result.robot_sn = value();
         else if (arg == "--wrist-shm") result.shared_memory = value();
+        else if (arg == "--teleop-shm") result.teleop_shared_memory = value();
         else if (arg == "--wrist-model") result.model_config = value();
         else if (arg == "--duration-s") result.duration_s = std::stod(value());
         else if (arg == "--radius-m") result.radius_m = std::stod(value());
@@ -381,6 +519,9 @@ Options Parse(int argc, char** argv)
         else if (arg == "--wrist-hard-timeout-ms") {
             result.wrist_hard_timeout_ms = std::stod(value());
         }
+        else if (arg == "--teleop-command-timeout-ms") {
+            result.teleop_command_timeout_ms = std::stod(value());
+        }
         else if (arg == "--cpu-affinity") result.cpu_affinity = std::stoi(value());
         else if (arg == "--dry-run-csv") result.dry_run_csv = value();
         else if (arg == "--real-confirm") {
@@ -403,7 +544,9 @@ Options Parse(int argc, char** argv)
         || result.wrist_state_timeout_ms < 100.0
         || result.wrist_state_timeout_ms > 1000.0
         || result.wrist_hard_timeout_ms <= result.wrist_state_timeout_ms
-        || result.wrist_hard_timeout_ms > 5000.0) {
+        || result.wrist_hard_timeout_ms > 5000.0
+        || result.teleop_command_timeout_ms < 20.0
+        || result.teleop_command_timeout_ms > 1000.0) {
         throw std::invalid_argument("invalid duration/radius/orientation");
     }
     if (result.trajectory != "orientation" && result.trajectory != "spin"
@@ -542,6 +685,138 @@ WristModel LoadWristModel(const std::string& path)
         else if (key == "wrist_torque_slew") {
             input >> model.wrist_torque_slew[0] >> model.wrist_torque_slew[1];
         }
+        else if (key == "teleop_target_filter_hz") {
+            input >> model.teleop_target_filter_hz;
+        }
+        else if (key == "teleop_max_linear_velocity_m_s") {
+            input >> model.teleop_max_linear_velocity_m_s;
+        }
+        else if (key == "teleop_max_linear_acceleration_m_s2") {
+            input >> model.teleop_max_linear_acceleration_m_s2;
+        }
+        else if (key == "teleop_max_angular_velocity_rad_s") {
+            input >> model.teleop_max_angular_velocity_rad_s;
+        }
+        else if (key == "teleop_max_angular_acceleration_rad_s2") {
+            input >> model.teleop_max_angular_acceleration_rad_s2;
+        }
+        else if (key == "teleop_arm_translation_kp") {
+            input >> model.teleop_arm_translation_kp;
+        }
+        else if (key == "teleop_arm_translation_kd") {
+            input >> model.teleop_arm_translation_kd;
+        }
+        else if (key == "teleop_arm_rotation_kp") {
+            input >> model.teleop_arm_rotation_kp;
+        }
+        else if (key == "teleop_arm_rotation_kd") {
+            input >> model.teleop_arm_rotation_kd;
+        }
+        else if (key == "mode2_arm_rotation_kp") {
+            input >> model.mode2_arm_rotation_kp;
+        }
+        else if (key == "mode2_arm_rotation_kd") {
+            input >> model.mode2_arm_rotation_kd;
+        }
+        else if (key == "mode2_arm_max_angular_velocity_rad_s") {
+            input >> model.mode2_arm_max_angular_velocity_rad_s;
+        }
+        else if (key == "mode2_arm_max_angular_acceleration_rad_s2") {
+            input >> model.mode2_arm_max_angular_acceleration_rad_s2;
+        }
+        else if (key == "mode2_posture_reference_rate_per_s") {
+            input >> model.mode2_posture_reference_rate_per_s;
+        }
+        else if (key == "teleop_wrist_target_filter_hz") {
+            input >> model.teleop_wrist_target_filter_hz;
+        }
+        else if (key == "teleop_wrist_target_max_velocity_rad_s") {
+            input >> model.teleop_wrist_target_max_velocity_rad_s[0]
+                  >> model.teleop_wrist_target_max_velocity_rad_s[1];
+        }
+        else if (key == "teleop_wrist_target_max_acceleration_rad_s2") {
+            input >> model.teleop_wrist_target_max_acceleration_rad_s2[0]
+                  >> model.teleop_wrist_target_max_acceleration_rad_s2[1];
+        }
+        else if (key == "teleop_max_operational_damping") {
+            input >> model.teleop_max_operational_damping;
+        }
+        else if (key == "teleop_singularity_characteristic_length_m") {
+            input >> model.teleop_singularity_characteristic_length_m;
+        }
+        else if (key == "teleop_singularity_slow_sigma") {
+            input >> model.teleop_singularity_slow_sigma;
+        }
+        else if (key == "teleop_singularity_critical_sigma") {
+            input >> model.teleop_singularity_critical_sigma;
+        }
+        else if (key == "teleop_singularity_min_motion_scale") {
+            input >> model.teleop_singularity_min_motion_scale;
+        }
+        else if (key == "teleop_posture_reference_rate_per_s") {
+            input >> model.teleop_posture_reference_rate_per_s;
+        }
+        else if (key == "clutch_hold_natural_frequency_hz") {
+            input >> model.clutch_hold_natural_frequency_hz;
+        }
+        else if (key == "clutch_hold_damping_ratio") {
+            input >> model.clutch_hold_damping_ratio;
+        }
+        else if (key == "dynamic_wrist_gravity_compensation") {
+            int enabled = 0;
+            input >> enabled;
+            if (enabled != 0 && enabled != 1) {
+                throw std::runtime_error(
+                    "dynamic_wrist_gravity_compensation must be 0 or 1");
+            }
+            model.dynamic_wrist_gravity_compensation = enabled != 0;
+        }
+        else if (key == "dynamic_gravity_filter_hz") {
+            input >> model.dynamic_gravity_filter_hz;
+        }
+        else if (key == "mode3_position_kp") input >> model.mode3_position_kp;
+        else if (key == "mode3_position_kd") input >> model.mode3_position_kd;
+        else if (key == "mode3_arm_rotation_kp") {
+            input >> model.mode3_arm_rotation_kp;
+        }
+        else if (key == "mode3_arm_rotation_kd") {
+            input >> model.mode3_arm_rotation_kd;
+        }
+        else if (key == "mode3_arm_max_angular_velocity_rad_s") {
+            input >> model.mode3_arm_max_angular_velocity_rad_s;
+        }
+        else if (key == "mode3_arm_max_angular_acceleration_rad_s2") {
+            input >> model.mode3_arm_max_angular_acceleration_rad_s2;
+        }
+        else if (key == "mode3_contact_enable_threshold_n") {
+            input >> model.mode3_contact_enable_threshold_n;
+        }
+        else if (key == "mode3_contact_release_threshold_n") {
+            input >> model.mode3_contact_release_threshold_n;
+        }
+        else if (key == "mode3_contact_release_delay_s") {
+            input >> model.mode3_contact_release_delay_s;
+        }
+        else if (key == "mode3_force_tolerance_n") {
+            input >> model.mode3_force_tolerance_n;
+        }
+        else if (key == "mode3_force_full_position_error_m") {
+            input >> model.mode3_force_full_position_error_m;
+        }
+        else if (key == "mode3_force_disable_position_error_m") {
+            input >> model.mode3_force_disable_position_error_m;
+        }
+        else if (key == "mode3_force_kp") input >> model.mode3_force_kp;
+        else if (key == "mode3_force_ki_per_s") input >> model.mode3_force_ki_per_s;
+        else if (key == "mode3_force_damping_n_s_m") {
+            input >> model.mode3_force_damping_n_s_m;
+        }
+        else if (key == "mode3_force_integral_limit_n") {
+            input >> model.mode3_force_integral_limit_n;
+        }
+        else if (key == "mode3_force_command_limit_n") {
+            input >> model.mode3_force_command_limit_n;
+        }
         else throw std::runtime_error("unknown wrist model key: " + key);
     }
     const auto tool_spatial = SpatialInertiaAtOrigin(model.active_tool_mass,
@@ -572,11 +847,89 @@ WristModel LoadWristModel(const std::string& path)
         || (model.arm_torque_limit.array() <= 0.0).any()
         || (model.arm_torque_slew.array() <= 0.0).any()
         || (model.wrist_torque_slew.array() <= 0.0).any()
+        || model.teleop_target_filter_hz <= 0.0
+        || model.teleop_max_linear_velocity_m_s <= 0.0
+        || model.teleop_max_linear_acceleration_m_s2 <= 0.0
+        || model.teleop_max_angular_velocity_rad_s <= 0.0
+        || model.teleop_max_angular_acceleration_rad_s2 <= 0.0
+        || model.teleop_arm_translation_kp <= 0.0
+        || model.teleop_arm_translation_kd <= 0.0
+        || model.teleop_arm_rotation_kp <= 0.0
+        || model.teleop_arm_rotation_kd <= 0.0
+        || model.mode2_arm_rotation_kp <= 0.0
+        || model.mode2_arm_rotation_kd <= 0.0
+        || model.mode2_arm_max_angular_velocity_rad_s <= 0.0
+        || model.mode2_arm_max_angular_acceleration_rad_s2 <= 0.0
+        || model.mode2_posture_reference_rate_per_s < 0.0
+        || model.mode2_posture_reference_rate_per_s > 10.0
+        || model.teleop_wrist_target_filter_hz <= 0.0
+        || (model.teleop_wrist_target_max_velocity_rad_s.array() <= 0.0).any()
+        || (model.teleop_wrist_target_max_acceleration_rad_s2.array() <= 0.0).any()
+        || model.teleop_max_operational_damping < 0.01
+        || model.teleop_max_operational_damping > 2.0
+        || model.teleop_singularity_characteristic_length_m <= 0.0
+        || model.teleop_singularity_critical_sigma <= 0.0
+        || model.teleop_singularity_slow_sigma
+               <= model.teleop_singularity_critical_sigma
+        || model.teleop_singularity_min_motion_scale <= 0.0
+        || model.teleop_singularity_min_motion_scale > 1.0
+        || model.teleop_posture_reference_rate_per_s <= 0.0
+        || model.teleop_posture_reference_rate_per_s > 10.0
+        || model.clutch_hold_natural_frequency_hz <= 0.0
+        || model.clutch_hold_damping_ratio < 1.0
+        || model.dynamic_gravity_filter_hz <= 0.0
+        || model.mode3_position_kp <= 0.0
+        || model.mode3_position_kd <= 0.0
+        || model.mode3_arm_rotation_kp <= 0.0
+        || model.mode3_arm_rotation_kd <= 0.0
+        || model.mode3_arm_max_angular_velocity_rad_s <= 0.0
+        || model.mode3_arm_max_angular_acceleration_rad_s2 <= 0.0
+        || model.mode3_contact_enable_threshold_n <= 0.0
+        || model.mode3_contact_release_threshold_n <= 0.0
+        || model.mode3_contact_release_threshold_n
+               >= model.mode3_contact_enable_threshold_n
+        || model.mode3_contact_release_delay_s <= 0.0
+        || model.mode3_force_tolerance_n <= 0.0
+        || model.mode3_force_full_position_error_m < 0.0
+        || model.mode3_force_disable_position_error_m
+               <= model.mode3_force_full_position_error_m
+        || model.mode3_force_kp < 0.0 || model.mode3_force_ki_per_s < 0.0
+        || model.mode3_force_damping_n_s_m < 0.0
+        || model.mode3_force_integral_limit_n <= 0.0
+        || model.mode3_force_command_limit_n <= 0.0
         || (model.joint_max - model.joint_min).minCoeff()
                <= 2.0 * model.joint_limit_margin_rad) {
         throw std::runtime_error("invalid wrist IK configuration");
     }
     return model;
+}
+
+Eigen::VectorXd InertiaShapedJointHold(const Eigen::MatrixXd& mass,
+    const Eigen::VectorXd& position_error,
+    const Eigen::VectorXd& joint_velocity, double natural_frequency_hz,
+    double damping_ratio)
+{
+    if (mass.rows() != mass.cols() || mass.rows() != position_error.size()
+        || position_error.size() != joint_velocity.size()
+        || natural_frequency_hz <= 0.0 || damping_ratio < 1.0) {
+        throw std::invalid_argument("invalid inertia-shaped hold parameters");
+    }
+    // Express the hold as a desired joint acceleration and then map it
+    // through the live Flexiv mass matrix. This gives every joint the same
+    // closed-loop return speed even though their physical inertias differ.
+    const double omega = 2.0 * kPi * natural_frequency_hz;
+    const Eigen::VectorXd desired_acceleration
+        = omega * omega * position_error
+          - 2.0 * damping_ratio * omega * joint_velocity;
+    return mass * desired_acceleration;
+}
+
+std::array<double, 7> PoseArray(
+    const Eigen::Vector3d& position, const Eigen::Matrix3d& rotation)
+{
+    const Eigen::Quaterniond quaternion(rotation);
+    return {position.x(), position.y(), position.z(), quaternion.w(),
+        quaternion.x(), quaternion.y(), quaternion.z()};
 }
 
 struct Controller {
@@ -603,13 +956,235 @@ struct Controller {
     Eigen::Vector2d filtered_wrist_velocity {Eigen::Vector2d::Zero()};
     bool wrist_velocity_initialized {false};
     Eigen::Vector2d previous_wrist_actuator_torque {Eigen::Vector2d::Zero()};
+    Eigen::Matrix<double, 7, 1> last_arm_wrist_gravity_delta {
+        Eigen::Matrix<double, 7, 1>::Zero()};
+    WristGravityResult filtered_dynamic_gravity {};
+    bool dynamic_gravity_filter_initialized {false};
     std::chrono::steady_clock::time_point torque_ramp_started {};
     double torque_ramp_duration_s {0.0};
+    TeleopSharedMemory* teleop_io {nullptr};
+    TeleopCommand teleop_command {};
+    TeleopControlMode teleop_mode {TeleopControlMode::Hold};
+    bool teleop_enabled {false};
+    bool teleop_command_fresh {false};
+    bool mode3_force_active {false};
+    Eigen::Vector3d teleop_position {Eigen::Vector3d::Zero()};
+    Eigen::Vector3d teleop_linear_velocity {Eigen::Vector3d::Zero()};
+    Eigen::Matrix3d teleop_rotation {Eigen::Matrix3d::Identity()};
+    Eigen::Vector3d teleop_angular_velocity {Eigen::Vector3d::Zero()};
+    Eigen::Matrix3d teleop_flange_rotation {Eigen::Matrix3d::Identity()};
+    Eigen::Vector3d teleop_flange_angular_velocity {Eigen::Vector3d::Zero()};
+    Eigen::Vector3d teleop_anchor_position {Eigen::Vector3d::Zero()};
+    Eigen::Matrix3d teleop_probe_anchor_rotation {Eigen::Matrix3d::Identity()};
+    Eigen::Matrix3d teleop_flange_anchor_rotation {Eigen::Matrix3d::Identity()};
+    Eigen::Matrix3d teleop_wrist_anchor_rotation {Eigen::Matrix3d::Identity()};
+    Eigen::Vector2d teleop_wrist_hold_q {Eigen::Vector2d::Zero()};
+    Eigen::Vector3d force_bias_world {Eigen::Vector3d::Zero()};
+    double mode3_force_integral_n {0.0};
+    std::uint32_t mode3_contact_loss_cycles {0};
+    double mode3_force_position_scale {0.0};
+    bool mode3_position_recovery_active {false};
+    double last_probe_force_z_n {0.0};
+    double last_force_error_n {0.0};
+    double last_position_error_m {0.0};
+    double last_orientation_error_rad {0.0};
+    Eigen::Vector3d last_arm_orientation_error_world {Eigen::Vector3d::Zero()};
+    double last_arm_singularity_sigma_min {0.0};
+    double last_arm_motion_scale {1.0};
+    Eigen::VectorXd teleop_safe_arm_q {Eigen::VectorXd::Zero(7)};
 
     static double SmoothRamp(double value)
     {
         const double u = std::clamp(value, 0.0, 1.0);
         return u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+    }
+
+    WristGravityResult FilterDynamicGravity(
+        const WristGravityResult& unfiltered)
+    {
+        if (!dynamic_gravity_filter_initialized) {
+            filtered_dynamic_gravity = unfiltered;
+            dynamic_gravity_filter_initialized = true;
+            return filtered_dynamic_gravity;
+        }
+        constexpr double dt = 0.001;
+        const double alpha = 1.0 - std::exp(
+            -2.0 * kPi * wrist_model.dynamic_gravity_filter_hz * dt);
+        filtered_dynamic_gravity.arm_delta += alpha
+            * (unfiltered.arm_delta - filtered_dynamic_gravity.arm_delta);
+        filtered_dynamic_gravity.wrist += alpha
+            * (unfiltered.wrist - filtered_dynamic_gravity.wrist);
+        return filtered_dynamic_gravity;
+    }
+
+    void ResetTeleopReference(const Eigen::Vector3d& task_position,
+        const Eigen::Matrix3d& probe_rotation,
+        const Eigen::Matrix3d& flange_rotation,
+        const Eigen::Matrix3d& wrist_rotation,
+        const Eigen::Vector2d& q_wrist, const Eigen::VectorXd& q_arm,
+        TeleopControlMode mode, bool enabled,
+        const std::chrono::steady_clock::time_point& now)
+    {
+        teleop_mode = mode;
+        teleop_enabled = enabled;
+        teleop_position = task_position;
+        teleop_linear_velocity.setZero();
+        teleop_rotation = probe_rotation;
+        teleop_angular_velocity.setZero();
+        teleop_flange_rotation = flange_rotation;
+        teleop_flange_angular_velocity.setZero();
+        teleop_anchor_position = task_position;
+        teleop_probe_anchor_rotation = probe_rotation;
+        teleop_flange_anchor_rotation = flange_rotation;
+        teleop_wrist_anchor_rotation = wrist_rotation;
+        teleop_wrist_hold_q = q_wrist;
+        q_reference.head<7>() = q_arm;
+        q_reference.tail<2>() = q_wrist;
+        // Every teleoperation edge defines a new stationary operating point.
+        // Capture the redundant seven-axis posture together with the Cartesian
+        // anchors. Reusing a startup/previous-mode null-space reference made
+        // the arm reconfigure itself even when the haptic delta was zero.
+        teleop_safe_arm_q = q_arm;
+        wrist_target_initialized = false;
+        mode3_force_integral_n = 0.0;
+        mode3_contact_loss_cycles = 0;
+        mode3_force_position_scale = 0.0;
+        mode3_position_recovery_active = false;
+        mode3_force_active = false;
+        torque_ramp_duration_s = wrist_model.stale_recovery_ramp_s;
+        // The measured Cartesian and redundant-joint references above make a
+        // clutch edge torque-continuous. Do not fade OSC support from zero on
+        // engagement: that old one-second gap removed Cartesian stiffness and
+        // allowed any payload/gravity residual to make the arm sag. The final
+        // actuator torque-rate limiter still prevents a command step. Startup
+        // and stale-state recovery retain their separate ramps.
+        torque_ramp_started
+            = now - std::chrono::duration_cast<
+                        std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(torque_ramp_duration_s));
+    }
+
+    void ShapeTeleopTarget(const Eigen::Vector3d& requested_position,
+        const Eigen::Matrix3d& requested_rotation,
+        const Eigen::Vector3d& requested_linear_velocity,
+        const Eigen::Vector3d& requested_angular_velocity,
+        double arm_motion_scale)
+    {
+        constexpr double dt = 0.001;
+        const double omega = 2.0 * kPi * wrist_model.teleop_target_filter_hz;
+        const Eigen::Vector3d position_error
+            = requested_position - teleop_position;
+        // A second-order shaper normally needs time to brake. For direct
+        // teleoperation that makes a quick right command continue left because
+        // velocity from the previous target survives. Cancel only genuinely
+        // opposing stored velocity before computing the next acceleration.
+        if (teleop_linear_velocity.dot(position_error) < 0.0) {
+            teleop_linear_velocity.setZero();
+        }
+        Eigen::Vector3d linear_acceleration
+            = omega * omega * position_error
+              + 2.0 * omega
+                    * (requested_linear_velocity - teleop_linear_velocity);
+        const double maximum_linear_acceleration
+            = arm_motion_scale
+              * wrist_model.teleop_max_linear_acceleration_m_s2;
+        if (linear_acceleration.norm() > maximum_linear_acceleration) {
+            linear_acceleration *= maximum_linear_acceleration
+                                   / linear_acceleration.norm();
+        }
+        teleop_linear_velocity += dt * linear_acceleration;
+        const double maximum_linear_velocity
+            = arm_motion_scale * wrist_model.teleop_max_linear_velocity_m_s;
+        if (teleop_linear_velocity.norm() > maximum_linear_velocity) {
+            teleop_linear_velocity *= maximum_linear_velocity
+                                      / teleop_linear_velocity.norm();
+        }
+        teleop_position += dt * teleop_linear_velocity;
+
+        const Eigen::Vector3d rotation_error
+            = RotationError(teleop_rotation, requested_rotation);
+        if (teleop_angular_velocity.dot(rotation_error) < 0.0) {
+            teleop_angular_velocity.setZero();
+        }
+        Eigen::Vector3d angular_acceleration
+            = omega * omega * rotation_error
+              + 2.0 * omega
+                    * (requested_angular_velocity - teleop_angular_velocity);
+        const double maximum_angular_acceleration
+            = arm_motion_scale
+              * wrist_model.teleop_max_angular_acceleration_rad_s2;
+        if (angular_acceleration.norm() > maximum_angular_acceleration) {
+            angular_acceleration *= maximum_angular_acceleration
+                                    / angular_acceleration.norm();
+        }
+        teleop_angular_velocity += dt * angular_acceleration;
+        const double maximum_angular_velocity
+            = arm_motion_scale * wrist_model.teleop_max_angular_velocity_rad_s;
+        if (teleop_angular_velocity.norm() > maximum_angular_velocity) {
+            teleop_angular_velocity *= maximum_angular_velocity
+                                       / teleop_angular_velocity.norm();
+        }
+        const Eigen::Vector3d rotation_step = dt * teleop_angular_velocity;
+        const double angle = rotation_step.norm();
+        if (angle > 1e-12) {
+            teleop_rotation
+                = Eigen::AngleAxisd(angle, rotation_step / angle).toRotationMatrix()
+                  * teleop_rotation;
+        }
+    }
+
+    const Eigen::Matrix3d& ShapeArmFlangeTarget(
+        const Eigen::Matrix3d& requested_flange_rotation,
+        double arm_motion_scale)
+    {
+        constexpr double dt = 0.001;
+        const double omega = 2.0 * kPi * wrist_model.teleop_target_filter_hz;
+        const Eigen::Vector3d error = RotationError(
+            teleop_flange_rotation, requested_flange_rotation);
+        if (teleop_flange_angular_velocity.dot(error) < 0.0) {
+            teleop_flange_angular_velocity.setZero();
+        }
+        Eigen::Vector3d acceleration
+            = omega * omega * error
+              - 2.0 * omega * teleop_flange_angular_velocity;
+        double configured_maximum_acceleration
+            = wrist_model.teleop_max_angular_acceleration_rad_s2;
+        if (teleop_mode == TeleopControlMode::ArmWrist9Dof) {
+            configured_maximum_acceleration
+                = wrist_model.mode2_arm_max_angular_acceleration_rad_s2;
+        } else if (teleop_mode == TeleopControlMode::OrientationForce) {
+            configured_maximum_acceleration
+                = wrist_model.mode3_arm_max_angular_acceleration_rad_s2;
+        }
+        const double maximum_acceleration
+            = arm_motion_scale * configured_maximum_acceleration;
+        if (acceleration.norm() > maximum_acceleration) {
+            acceleration *= maximum_acceleration / acceleration.norm();
+        }
+        teleop_flange_angular_velocity += dt * acceleration;
+        double configured_maximum_velocity
+            = wrist_model.teleop_max_angular_velocity_rad_s;
+        if (teleop_mode == TeleopControlMode::ArmWrist9Dof) {
+            configured_maximum_velocity
+                = wrist_model.mode2_arm_max_angular_velocity_rad_s;
+        } else if (teleop_mode == TeleopControlMode::OrientationForce) {
+            configured_maximum_velocity
+                = wrist_model.mode3_arm_max_angular_velocity_rad_s;
+        }
+        const double maximum_velocity
+            = arm_motion_scale * configured_maximum_velocity;
+        if (teleop_flange_angular_velocity.norm() > maximum_velocity) {
+            teleop_flange_angular_velocity
+                *= maximum_velocity / teleop_flange_angular_velocity.norm();
+        }
+        const Eigen::Vector3d step = dt * teleop_flange_angular_velocity;
+        const double angle = step.norm();
+        if (angle > 1e-12) {
+            teleop_flange_rotation
+                = Eigen::AngleAxisd(angle, step / angle).toRotationMatrix()
+                  * teleop_flange_rotation;
+        }
+        return teleop_flange_rotation;
     }
 
     Eigen::Vector2d ShapeWristTarget(
@@ -621,18 +1196,37 @@ struct Controller {
             wrist_target_initialized = true;
         }
         constexpr double dt = 0.001;
-        const double omega = 2.0 * kPi * wrist_model.wrist_target_filter_hz;
+        const bool teleoperation = teleop_io != nullptr;
+        const double filter_hz
+            = teleoperation ? wrist_model.teleop_wrist_target_filter_hz
+                            : wrist_model.wrist_target_filter_hz;
+        const Eigen::Vector2d& maximum_velocity
+            = teleoperation
+                  ? wrist_model.teleop_wrist_target_max_velocity_rad_s
+                  : wrist_model.wrist_target_max_velocity_rad_s;
+        const Eigen::Vector2d& maximum_acceleration
+            = teleoperation
+                  ? wrist_model.teleop_wrist_target_max_acceleration_rad_s2
+                  : wrist_model.wrist_target_max_acceleration_rad_s2;
+        const double omega = 2.0 * kPi * filter_hz;
+        const Eigen::Vector2d target_error
+            = raw_target - shaped_wrist_target;
+        for (int axis = 0; axis < 2; ++axis) {
+            if (shaped_wrist_velocity[axis] * target_error[axis] < 0.0) {
+                shaped_wrist_velocity[axis] = 0.0;
+            }
+        }
         Eigen::Vector2d acceleration
-            = omega * omega * (raw_target - shaped_wrist_target)
+            = omega * omega * target_error
               - 2.0 * omega * shaped_wrist_velocity;
         acceleration = acceleration
-                           .cwiseMin(wrist_model.wrist_target_max_acceleration_rad_s2)
-                           .cwiseMax(-wrist_model.wrist_target_max_acceleration_rad_s2);
+                           .cwiseMin(maximum_acceleration)
+                           .cwiseMax(-maximum_acceleration);
         shaped_wrist_velocity += dt * acceleration;
         shaped_wrist_velocity
             = shaped_wrist_velocity
-                  .cwiseMin(wrist_model.wrist_target_max_velocity_rad_s)
-                  .cwiseMax(-wrist_model.wrist_target_max_velocity_rad_s);
+                  .cwiseMin(maximum_velocity)
+                  .cwiseMax(-maximum_velocity);
         shaped_wrist_target += dt * shaped_wrist_velocity;
         const Eigen::Vector2d lower
             = wrist_model.joint_min.array() + wrist_model.joint_limit_margin_rad;
@@ -681,7 +1275,11 @@ struct Controller {
                         "wrist state continuously stale beyond hard timeout");
                 }
                 const Eigen::VectorXd hold_request
-                    = arm_coriolis + 12.0 * (stale_hold_arm_q - qa) - 4.0 * dqa;
+                    = arm_coriolis + last_arm_wrist_gravity_delta
+                      + InertiaShapedJointHold(arm_model.M(),
+                            stale_hold_arm_q - qa, dqa,
+                            wrist_model.clutch_hold_natural_frequency_hz,
+                            wrist_model.clutch_hold_damping_ratio);
                 Eigen::VectorXd arm_absolute_limit(7), arm_rate_limit(7);
                 arm_absolute_limit << 20.0, 20.0, 15.0, 15.0, 8.0, 8.0, 5.0;
                 arm_rate_limit << 200.0, 200.0, 150.0, 150.0, 80.0, 80.0, 50.0;
@@ -724,13 +1322,25 @@ struct Controller {
             const WristKinematics wrist = EvaluateWrist(wrist_model, q_wrist);
             const Eigen::Vector3d flange_position = PosePosition(states.flange_pose);
             const Eigen::Matrix3d flange_rotation = PoseRotation(states.flange_pose);
+            WristGravityResult unfiltered_dynamic_gravity = DynamicWristGravity(
+                wrist_model, q_wrist, flange_jacobian, flange_rotation);
+            if (!wrist_model.dynamic_wrist_gravity_compensation) {
+                // Retain complete wrist-axis compensation even when the
+                // arm-side live-minus-zero correction is disabled for an
+                // explicit diagnostic comparison.
+                unfiltered_dynamic_gravity.arm_delta.setZero();
+            }
+            const WristGravityResult dynamic_gravity
+                = FilterDynamicGravity(unfiltered_dynamic_gravity);
+            last_arm_wrist_gravity_delta = dynamic_gravity.arm_delta;
             // For the comparison demo, control the intersecting wrist-axis
             // pivot as the positional task and the probe as the orientation
             // task. Wrist rotation then does not create a fictitious 50--120
             // mm translation error that the seven arm joints must cancel.
             // "tip" remains available for experiments that truly require the
             // physical probe point to follow the Cartesian path.
-            const bool pivot_task = options.endpoint == "pivot";
+            const bool pivot_task
+                = teleop_io == nullptr && options.endpoint == "pivot";
             const Eigen::Vector3d task_offset_flange
                 = pivot_task ? wrist_model.joint1_origin
                              : wrist.position_flange;
@@ -778,93 +1388,510 @@ struct Controller {
             }
             const double elapsed
                 = std::chrono::duration<double>(now - started).count();
-            LoopTarget target;
-            if (options.trajectory == "orientation") {
-                target = ContinuousOrientationTarget(position_origin,
-                    rotation_origin, elapsed, 1.0 / options.duration_s,
-                    options.orientation_deg * kPi / 180.0);
-            } else if (options.trajectory == "spin") {
-                target = ContinuousSpinTarget(position_origin, rotation_origin,
-                    elapsed, 1.0 / options.duration_s,
-                    options.orientation_deg * kPi / 180.0);
-            } else if (options.trajectory == "rectangle") {
-                target = ContinuousRoundedRectangleTarget(position_origin,
-                    rotation_origin, elapsed, options.rectangle_width_m,
-                    options.rectangle_height_m,
-                    options.rectangle_corner_radius_m,
-                    1.0 / options.duration_s, options.tangent_axis);
+            Eigen::VectorXd error = Eigen::VectorXd::Zero(6);
+            Eigen::VectorXd osc_torque = Eigen::VectorXd::Zero(9);
+            Eigen::MatrixXd task_lambda = Eigen::MatrixXd::Identity(6, 6);
+            Eigen::Vector2d raw_wrist_target = q_reference.tail<2>();
+            Eigen::Vector2d hybrid_force_feedforward = Eigen::Vector2d::Zero();
+            double operational_damping = 0.03;
+            const Eigen::VectorXd full_twist = jacobian * dq;
+            last_probe_force_z_n = 0.0;
+            last_force_error_n = 0.0;
+            mode3_position_recovery_active = false;
+
+            if (teleop_io != nullptr) {
+                TeleopCommand command;
+                std::uint64_t command_age_ns = 0;
+                const bool received = teleop_io->ReadCommand(
+                    command, command_age_ns);
+                teleop_command_fresh
+                    = received
+                      && command_age_ns
+                             <= static_cast<std::uint64_t>(
+                                 options.teleop_command_timeout_ms * 1e6);
+                if (teleop_command_fresh) teleop_command = command;
+                const TeleopControlMode requested_mode
+                    = teleop_command_fresh ? teleop_command.mode : teleop_mode;
+                const bool requested_enabled
+                    = teleop_command_fresh && teleop_command.enabled;
+                if (requested_mode != teleop_mode
+                    || requested_enabled != teleop_enabled) {
+                    ResetTeleopReference(task_position, probe_rotation,
+                        flange_rotation, wrist.rotation_flange, q_wrist, qa,
+                        requested_mode, requested_enabled, now);
+                    std::cout << "RT_TELEOP mode="
+                              << static_cast<std::uint32_t>(teleop_mode)
+                              << " enabled=" << static_cast<int>(teleop_enabled)
+                              << std::endl;
+                }
+
+                Eigen::Vector3d requested_position = teleop_anchor_position;
+                Eigen::Matrix3d requested_rotation
+                    = teleop_probe_anchor_rotation;
+                Eigen::Vector3d requested_linear_velocity
+                    = Eigen::Vector3d::Zero();
+                Eigen::Vector3d requested_angular_velocity
+                    = Eigen::Vector3d::Zero();
+                if (teleop_enabled && teleop_command_fresh) {
+                    requested_position = PosePosition(teleop_command.target_pose);
+                    requested_rotation = PoseRotation(teleop_command.target_pose);
+                    requested_linear_velocity = Eigen::Map<const Eigen::Vector3d>(
+                        teleop_command.target_linear_velocity.data());
+                    requested_angular_velocity = Eigen::Map<const Eigen::Vector3d>(
+                        teleop_command.target_angular_velocity.data());
+                    if (teleop_mode == TeleopControlMode::OrientationForce) {
+                        // Mode 3 explicitly discards haptic translation.
+                        requested_position = teleop_anchor_position;
+                        requested_linear_velocity.setZero();
+                    }
+                }
+                Eigen::Matrix<double, 6, 7> teleop_arm_jacobian
+                    = jacobian.leftCols<7>();
+                if (teleop_mode == TeleopControlMode::ArmWrist9Dof
+                    || teleop_mode == TeleopControlMode::OrientationForce) {
+                    // Translation is measured at the physical probe point;
+                    // orientation allocation is measured at the flange so
+                    // Flexiv does not cancel useful q8/q9 rotation.
+                    teleop_arm_jacobian.bottomRows<3>()
+                        = flange_jacobian.bottomRows<3>();
+                }
+                const ArmSingularityStatus singularity
+                    = EvaluateArmSingularity(teleop_arm_jacobian,
+                        wrist_model.teleop_singularity_characteristic_length_m,
+                        wrist_model.teleop_singularity_slow_sigma,
+                        wrist_model.teleop_singularity_critical_sigma,
+                        wrist_model.teleop_singularity_min_motion_scale);
+                last_arm_singularity_sigma_min = singularity.sigma_min;
+                last_arm_motion_scale = singularity.motion_scale;
+                if (teleop_enabled
+                    && singularity.sigma_min
+                           >= wrist_model.teleop_singularity_slow_sigma) {
+                    // Mode 1 may let this engagement's redundancy reference
+                    // follow deliberate healthy motion slowly. Mode 2 defaults
+                    // to a zero rate, preserving the clutch-captured arm
+                    // posture while q8/q9 take the reachable orientation.
+                    // Near a singularity every mode freezes its latest healthy
+                    // posture reference.
+                    const double posture_reference_rate
+                        = teleop_mode == TeleopControlMode::ArmWrist9Dof
+                              ? wrist_model.mode2_posture_reference_rate_per_s
+                              : wrist_model.teleop_posture_reference_rate_per_s;
+                    const double alpha = std::clamp(
+                        0.001 * posture_reference_rate, 0.0, 1.0);
+                    teleop_safe_arm_q += alpha * (qa - teleop_safe_arm_q);
+                }
+                ShapeTeleopTarget(requested_position, requested_rotation,
+                    requested_linear_velocity, requested_angular_velocity,
+                    singularity.motion_scale);
+                last_arm_orientation_error_world.setZero();
+                if (!teleop_enabled) {
+                    // A released clutch is a joint brake/hold, not another
+                    // Cartesian redistribution task. Capture happened on the
+                    // release edge in ResetTeleopReference(). Applying this
+                    // immediately (without a startup ramp) removes residual
+                    // target-filter velocity and prevents the 9-DoF allocator
+                    // from moving the arm while settling the wrist.
+                    osc_torque.head<7>() = InertiaShapedJointHold(arm_mass,
+                        q_reference.head<7>() - qa, dqa,
+                        wrist_model.clutch_hold_natural_frequency_hz,
+                        wrist_model.clutch_hold_damping_ratio);
+                    raw_wrist_target = teleop_wrist_hold_q;
+                    error.head<3>() = teleop_position - task_position;
+                    error.tail<3>()
+                        = RotationError(probe_rotation, teleop_rotation);
+                } else if (teleop_mode == TeleopControlMode::Arm7Dof
+                    || teleop_mode == TeleopControlMode::Hold) {
+                    const Eigen::VectorXd arm_twist
+                        = teleop_arm_jacobian * dqa;
+                    Eigen::VectorXd velocity_error(6), desired_acceleration(6);
+                    error.head<3>() = teleop_position - task_position;
+                    error.tail<3>()
+                        = RotationError(probe_rotation, teleop_rotation);
+                    last_arm_orientation_error_world = error.tail<3>();
+                    velocity_error.head<3>()
+                        = teleop_linear_velocity - arm_twist.head<3>();
+                    velocity_error.tail<3>()
+                        = teleop_angular_velocity - arm_twist.tail<3>();
+                    desired_acceleration.setZero();
+                    operational_damping = AutomaticOperationalDamping(
+                        arm_mass, teleop_arm_jacobian,
+                        wrist_model.teleop_max_operational_damping);
+                    const auto arm_result = OperationalSpaceTorque(arm_mass,
+                        teleop_arm_jacobian, error, velocity_error,
+                        desired_acceleration,
+                        teleop_safe_arm_q - qa, dqa,
+                        wrist_model.teleop_arm_translation_kp,
+                        wrist_model.teleop_arm_translation_kd,
+                        wrist_model.teleop_arm_rotation_kp,
+                        wrist_model.teleop_arm_rotation_kd,
+                        wrist_model.nullspace_kp,
+                        wrist_model.nullspace_kd, operational_damping);
+                    osc_torque.head<7>() = arm_result.torque;
+                    task_lambda = arm_result.lambda;
+                    raw_wrist_target = teleop_wrist_hold_q;
+                } else {
+                    double mode3_position_priority_scale = 1.0;
+                    if (teleop_mode == TeleopControlMode::OrientationForce) {
+                        const double position_error_norm
+                            = (teleop_anchor_position - task_position).norm();
+                        const double fade_width
+                            = wrist_model
+                                  .mode3_force_disable_position_error_m
+                              - wrist_model
+                                    .mode3_force_full_position_error_m;
+                        mode3_position_priority_scale = SmoothRamp(
+                            (wrist_model
+                                     .mode3_force_disable_position_error_m
+                                  - position_error_norm)
+                            / fade_width);
+                        mode3_position_recovery_active
+                            = mode3_position_priority_scale < 0.999;
+                    }
+                    const Eigen::Matrix3d rotation_delta_world
+                        = requested_rotation
+                          * teleop_probe_anchor_rotation.transpose();
+                    const Eigen::Matrix3d rotation_delta_flange
+                        = teleop_flange_anchor_rotation.transpose()
+                          * rotation_delta_world
+                          * teleop_flange_anchor_rotation;
+                    const Eigen::Matrix3d desired_wrist_rotation
+                        = rotation_delta_flange * teleop_wrist_anchor_rotation;
+                    const Eigen::Vector2d wrist_ik_seed
+                        = wrist_target_initialized ? shaped_wrist_target
+                                                   : q_wrist;
+                    raw_wrist_target = SolveWristOrientationTarget(
+                        wrist_model, wrist_ik_seed, desired_wrist_rotation);
+                    if (teleop_mode == TeleopControlMode::OrientationForce) {
+                        // If the contact point is displaced, pause new q8/q9
+                        // orientation progress. Joint-8 rotation moves the
+                        // offset physical TCP, so continuing the wrist target
+                        // while the arm is recovering can detach the probe.
+                        // Resume smoothly after XYZ returns inside 1 mm.
+                        raw_wrist_target = q_wrist
+                            + mode3_position_priority_scale
+                                  * (raw_wrist_target - q_wrist);
+                    }
+                    const WristKinematics desired_wrist
+                        = EvaluateWrist(wrist_model, raw_wrist_target);
+                    const Eigen::Matrix3d raw_desired_flange_rotation
+                        = requested_rotation
+                          * desired_wrist.rotation_flange.transpose();
+                    const Eigen::Matrix3d desired_flange_rotation
+                        = ShapeArmFlangeTarget(raw_desired_flange_rotation,
+                            singularity.motion_scale
+                                * mode3_position_priority_scale);
+
+                    if (teleop_mode == TeleopControlMode::OrientationForce
+                        && teleop_enabled) {
+                        // Hierarchical Mode 3 allocation:
+                        //   1. q8/q9 own every orientation component their two
+                        //      physical axes can generate;
+                        //   2. Flexiv holds the physical probe point and only
+                        //      supplies the small residual flange rotation.
+                        // This avoids making all nine joints race toward the
+                        // same orientation error while the slower moteus
+                        // position loop is still following its target.
+                        const Eigen::Vector3d tool_z = probe_rotation.col(2);
+                        const Eigen::Vector3d position_error
+                            = teleop_anchor_position - task_position;
+                        const Eigen::Vector3d orientation_error
+                            = RotationError(probe_rotation, requested_rotation);
+                        error.head<3>() = position_error;
+                        error.tail<3>() = orientation_error;
+                        const Eigen::Vector3d arm_orientation_error
+                            = RotationError(
+                            flange_rotation, desired_flange_rotation);
+                        last_arm_orientation_error_world
+                            = arm_orientation_error;
+                        // Position damping observes the complete physical tip
+                        // velocity, including q8/q9. Flexiv therefore cancels
+                        // only the tip displacement caused by wrist rotation.
+                        // Its angular task observes flange motion only, so it
+                        // never tries to cancel the useful q8/q9 rotation.
+                        const Eigen::Vector3d position_velocity_error
+                            = -full_twist.head<3>();
+                        const Eigen::Vector3d orientation_velocity_error
+                            = -(flange_jacobian.bottomRows<3>() * dqa);
+                        const Eigen::Matrix<double, 3, 7> position_jacobian
+                            = teleop_arm_jacobian.topRows<3>();
+                        const Eigen::Matrix<double, 3, 7> orientation_jacobian
+                            = flange_jacobian.bottomRows<3>();
+                        operational_damping = AutomaticOperationalDamping(
+                            arm_mass, position_jacobian,
+                            wrist_model.teleop_max_operational_damping);
+                        const auto motion_result
+                            = PositionPriorityOperationalSpaceTorque(
+                            arm_mass, position_jacobian,
+                            orientation_jacobian, position_error,
+                            position_velocity_error, arm_orientation_error,
+                            orientation_velocity_error,
+                            teleop_safe_arm_q - qa, dqa,
+                            wrist_model.mode3_position_kp,
+                            wrist_model.mode3_position_kd,
+                            wrist_model.mode3_arm_rotation_kp,
+                            wrist_model.mode3_arm_rotation_kd,
+                            wrist_model.nullspace_kp,
+                            wrist_model.nullspace_kd, operational_damping,
+                            mode3_position_priority_scale);
+                        osc_torque.head<7>() = motion_result.torque;
+                        task_lambda = motion_result.lambda;
+
+                        const Eigen::Vector3d measured_force_world
+                            = Eigen::Map<const Eigen::Vector3d>(
+                                  states.ext_wrench_in_world.data())
+                              - force_bias_world;
+                        last_probe_force_z_n
+                            = tool_z.dot(measured_force_world);
+                        last_force_error_n
+                            = teleop_command.target_force_z_n
+                              - last_probe_force_z_n;
+                        const bool contact_has_target_sign
+                            = teleop_command.target_force_z_n
+                                  * last_probe_force_z_n
+                              > 0.0;
+                        if (!mode3_force_active
+                            && contact_has_target_sign
+                            && std::abs(last_probe_force_z_n)
+                                   >= wrist_model
+                                       .mode3_contact_enable_threshold_n
+                            && position_error.norm()
+                                   <= wrist_model
+                                       .mode3_force_disable_position_error_m) {
+                            mode3_force_active = true;
+                            mode3_force_integral_n = 0.0;
+                            mode3_contact_loss_cycles = 0;
+                            std::cout
+                                << "RT_MODE3 force control latched at measured_Fz="
+                                << last_probe_force_z_n << "N" << std::endl;
+                        }
+                        if (mode3_force_active) {
+                            const bool contact_still_valid
+                                = contact_has_target_sign
+                                  && std::abs(last_probe_force_z_n)
+                                         >= wrist_model
+                                             .mode3_contact_release_threshold_n;
+                            if (contact_still_valid) {
+                                mode3_contact_loss_cycles = 0;
+                            } else {
+                                ++mode3_contact_loss_cycles;
+                            }
+                            const std::uint32_t release_cycles
+                                = static_cast<std::uint32_t>(std::max(
+                                    1.0, std::ceil(1000.0
+                                        * wrist_model
+                                              .mode3_contact_release_delay_s)));
+                            if (mode3_contact_loss_cycles >= release_cycles) {
+                                mode3_force_active = false;
+                                mode3_force_integral_n = 0.0;
+                                mode3_force_position_scale = 0.0;
+                                std::cout
+                                    << "RT_MODE3 contact lost; force term off, "
+                                       "captured XYZ hold remains active"
+                                    << std::endl;
+                            }
+                        }
+                        if (mode3_force_active) {
+                            // Fixed Cartesian point has priority over force.
+                            // The force term is fully active only close to the
+                            // captured point, then fades smoothly to zero. It
+                            // can therefore never turn into a free-space
+                            // surface-search command after contact is lost.
+                            const double position_fade_width
+                                = wrist_model
+                                      .mode3_force_disable_position_error_m
+                                  - wrist_model
+                                        .mode3_force_full_position_error_m;
+                            const double position_fade_input
+                                = (wrist_model
+                                         .mode3_force_disable_position_error_m
+                                      - position_error.norm())
+                                  / position_fade_width;
+                            mode3_force_position_scale
+                                = SmoothRamp(position_fade_input);
+
+                            // Accept the requested force as a band rather than
+                            // chasing one noisy number. For a -15 N target and
+                            // 1 N tolerance, every reading in [-16,-14] N has
+                            // zero PI error.
+                            double force_error_outside_tolerance = 0.0;
+                            if (std::abs(last_force_error_n)
+                                > wrist_model.mode3_force_tolerance_n) {
+                                force_error_outside_tolerance
+                                    = last_force_error_n
+                                      - std::copysign(
+                                          wrist_model.mode3_force_tolerance_n,
+                                          last_force_error_n);
+                            }
+                            if (force_error_outside_tolerance == 0.0
+                                || mode3_force_position_scale < 0.999) {
+                                // Remove old integral gently while the force
+                                // is accepted or while position recovery owns
+                                // the task; this prevents hidden wind-up.
+                                mode3_force_integral_n
+                                    *= std::exp(-2.0 * 0.001);
+                            } else {
+                                mode3_force_integral_n += 0.001
+                                    * wrist_model.mode3_force_ki_per_s
+                                    * force_error_outside_tolerance;
+                                mode3_force_integral_n = std::clamp(
+                                    mode3_force_integral_n,
+                                    -wrist_model.mode3_force_integral_limit_n,
+                                    wrist_model.mode3_force_integral_limit_n);
+                            }
+                            const double axial_velocity
+                                = tool_z.dot(full_twist.head<3>());
+                            double actuator_force_z
+                                = -teleop_command.target_force_z_n
+                                  - wrist_model.mode3_force_kp
+                                        * force_error_outside_tolerance
+                                  - mode3_force_integral_n
+                                  - wrist_model.mode3_force_damping_n_s_m
+                                        * axial_velocity;
+                            actuator_force_z = mode3_force_position_scale
+                                * std::clamp(actuator_force_z,
+                                    -wrist_model.mode3_force_command_limit_n,
+                                    wrist_model.mode3_force_command_limit_n);
+                            const Eigen::Matrix<double, 1, 9> force_jacobian
+                                = tool_z.transpose()
+                                  * jacobian.topRows<3>();
+                            const Eigen::VectorXd force_torque
+                                = force_jacobian.transpose()
+                                  * actuator_force_z;
+                            osc_torque += force_torque;
+                            hybrid_force_feedforward
+                                = force_torque.tail<2>();
+                        } else {
+                            // A non-zero force target must never become an
+                            // autonomous free-space search. The operator first
+                            // makes gentle contact, then this gate latches.
+                            mode3_force_integral_n = 0.0;
+                            mode3_contact_loss_cycles = 0;
+                            mode3_force_position_scale = 0.0;
+                        }
+                    } else {
+                        // Mode 2 uses the same natural wrist-first allocation
+                        // as Mode 3, but its Cartesian position follows the
+                        // haptic target. There is no artificial angle gain:
+                        // q8/q9 solve their reachable 2-axis orientation 1:1,
+                        // while Flexiv supplies translation and only the
+                        // remaining flange rotation. Position is the primary
+                        // task; residual arm orientation is projected into its
+                        // dynamically consistent null space. This prevents the
+                        // seven-axis arm from performing a large reconfiguration
+                        // merely to reduce a small residual orientation error.
+                        error.head<3>() = teleop_position - task_position;
+                        error.tail<3>()
+                            = RotationError(probe_rotation, requested_rotation);
+                        const Eigen::Vector3d arm_orientation_error = RotationError(
+                            flange_rotation, desired_flange_rotation);
+                        last_arm_orientation_error_world = arm_orientation_error;
+                        const Eigen::Vector3d position_velocity_error
+                            = teleop_linear_velocity - full_twist.head<3>();
+                        const Eigen::Vector3d orientation_velocity_error
+                            = -(flange_jacobian.bottomRows<3>() * dqa);
+                        const Eigen::Matrix<double, 3, 7> position_jacobian
+                            = teleop_arm_jacobian.topRows<3>();
+                        const Eigen::Matrix<double, 3, 7> orientation_jacobian
+                            = flange_jacobian.bottomRows<3>();
+                        operational_damping = AutomaticOperationalDamping(
+                            arm_mass, position_jacobian,
+                            wrist_model.teleop_max_operational_damping);
+                        const auto result = PositionPriorityOperationalSpaceTorque(
+                            arm_mass, position_jacobian, orientation_jacobian,
+                            error.head<3>(), position_velocity_error,
+                            arm_orientation_error, orientation_velocity_error,
+                            teleop_safe_arm_q - qa, dqa,
+                            wrist_model.teleop_arm_translation_kp,
+                            wrist_model.teleop_arm_translation_kd,
+                            wrist_model.mode2_arm_rotation_kp,
+                            wrist_model.mode2_arm_rotation_kd,
+                            wrist_model.nullspace_kp,
+                            wrist_model.nullspace_kd,
+                            operational_damping);
+                        osc_torque.head<7>() = result.torque;
+                        task_lambda = result.lambda;
+                        last_force_error_n = 0.0;
+                    }
+                }
             } else {
-                target = ContinuousLoopTarget(position_origin, rotation_origin,
-                    elapsed, options.radius_m, 1.0 / options.duration_s,
-                    options.orientation_deg * kPi / 180.0);
-            }
-            const Eigen::VectorXd twist = jacobian * dq;
-            Eigen::VectorXd error(6), velocity_error(6), desired_acceleration(6);
-            error.head<3>() = target.position - task_position;
-            error.tail<3>() = RotationError(probe_rotation, target.rotation);
-            velocity_error.head<3>() = target.linear_velocity - twist.head<3>();
-            velocity_error.tail<3>() = target.angular_velocity - twist.tail<3>();
-            desired_acceleration.head<3>() = target.linear_acceleration;
-            desired_acceleration.tail<3>() = target.angular_acceleration;
-            // Ask the distal wrist to realize the target orientation relative
-            // to the startup flange, not relative to the already-moving arm.
-            // The old latter formulation let the Flexiv arm satisfy the task
-            // first, causing the wrist target to collapse back toward its
-            // startup angle and making q8/q9 barely move.
-            Eigen::Vector2d raw_wrist_target;
-            if (options.trajectory == "rectangle") {
-                const double phase = 2.0 * kPi * elapsed / options.duration_s;
-                const double ramp_u = std::clamp(elapsed / 2.0, 0.0, 1.0);
-                const double envelope = 10.0 * std::pow(ramp_u, 3)
-                                        - 15.0 * std::pow(ramp_u, 4)
-                                        + 6.0 * std::pow(ramp_u, 5);
-                raw_wrist_target = q_reference.tail<2>()
-                               + envelope
-                                     * Eigen::Vector2d(
-                                         wrist_model.wrist_rectangle_excursion_rad[0]
-                                             * std::sin(phase),
-                                         wrist_model.wrist_rectangle_excursion_rad[1]
-                                             * std::sin(2.0 * phase));
-                const Eigen::Vector2d lower
-                    = wrist_model.joint_min.array()
-                      + wrist_model.joint_limit_margin_rad;
-                const Eigen::Vector2d upper
-                    = wrist_model.joint_max.array()
-                      - wrist_model.joint_limit_margin_rad;
-                raw_wrist_target = raw_wrist_target.cwiseMax(lower).cwiseMin(upper);
-            } else {
-                const Eigen::Matrix3d nominal_wrist_rotation_flange
-                    = flange_rotation_reference.transpose() * target.rotation;
-                // Natural allocation: solve the actual requested relative
-                // orientation once. Do not amplify it and then ask Flexiv to
-                // cancel the artificial excess. The two wrist axes take every
-                // reachable component; the arm OSC supplies only the residual.
-                const Eigen::Matrix3d desired_wrist_rotation_flange
-                    = nominal_wrist_rotation_flange;
-                raw_wrist_target = SolveWristOrientationTarget(
-                    wrist_model, q_wrist, desired_wrist_rotation_flange);
+                LoopTarget target;
+                if (options.trajectory == "orientation") {
+                    target = ContinuousOrientationTarget(position_origin,
+                        rotation_origin, elapsed, 1.0 / options.duration_s,
+                        options.orientation_deg * kPi / 180.0);
+                } else if (options.trajectory == "spin") {
+                    target = ContinuousSpinTarget(position_origin,
+                        rotation_origin, elapsed, 1.0 / options.duration_s,
+                        options.orientation_deg * kPi / 180.0);
+                } else if (options.trajectory == "rectangle") {
+                    target = ContinuousRoundedRectangleTarget(position_origin,
+                        rotation_origin, elapsed, options.rectangle_width_m,
+                        options.rectangle_height_m,
+                        options.rectangle_corner_radius_m,
+                        1.0 / options.duration_s, options.tangent_axis);
+                } else {
+                    target = ContinuousLoopTarget(position_origin,
+                        rotation_origin, elapsed, options.radius_m,
+                        1.0 / options.duration_s,
+                        options.orientation_deg * kPi / 180.0);
+                }
+                Eigen::VectorXd velocity_error(6), desired_acceleration(6);
+                error.head<3>() = target.position - task_position;
+                error.tail<3>() = RotationError(probe_rotation, target.rotation);
+                velocity_error.head<3>()
+                    = target.linear_velocity - full_twist.head<3>();
+                velocity_error.tail<3>()
+                    = target.angular_velocity - full_twist.tail<3>();
+                desired_acceleration.head<3>() = target.linear_acceleration;
+                desired_acceleration.tail<3>() = target.angular_acceleration;
+                if (options.trajectory == "rectangle") {
+                    const double phase = 2.0 * kPi * elapsed / options.duration_s;
+                    const double ramp_u = std::clamp(elapsed / 2.0, 0.0, 1.0);
+                    const double envelope = 10.0 * std::pow(ramp_u, 3)
+                                            - 15.0 * std::pow(ramp_u, 4)
+                                            + 6.0 * std::pow(ramp_u, 5);
+                    raw_wrist_target = q_reference.tail<2>()
+                        + envelope
+                              * Eigen::Vector2d(
+                                  wrist_model.wrist_rectangle_excursion_rad[0]
+                                      * std::sin(phase),
+                                  wrist_model.wrist_rectangle_excursion_rad[1]
+                                      * std::sin(2.0 * phase));
+                    const Eigen::Vector2d lower
+                        = wrist_model.joint_min.array()
+                          + wrist_model.joint_limit_margin_rad;
+                    const Eigen::Vector2d upper
+                        = wrist_model.joint_max.array()
+                          - wrist_model.joint_limit_margin_rad;
+                    raw_wrist_target
+                        = raw_wrist_target.cwiseMax(lower).cwiseMin(upper);
+                } else {
+                    const Eigen::Matrix3d desired_wrist_rotation_flange
+                        = flange_rotation_reference.transpose()
+                          * target.rotation;
+                    raw_wrist_target = SolveWristOrientationTarget(
+                        wrist_model, q_wrist,
+                        desired_wrist_rotation_flange);
+                }
+                Eigen::VectorXd null_error = q_reference - q;
+                null_error.tail<2>().setZero();
+                operational_damping
+                    = options.inertia_mode == "auto"
+                          ? AutomaticOperationalDamping(mass, jacobian)
+                          : 0.03;
+                const auto result = OperationalSpaceTorque(mass, jacobian,
+                    error, velocity_error, desired_acceleration, null_error,
+                    dq, wrist_model.task_translation_kp,
+                    wrist_model.task_translation_kd,
+                    wrist_model.task_rotation_kp,
+                    wrist_model.task_rotation_kd,
+                    wrist_model.nullspace_kp,
+                    wrist_model.nullspace_kd, operational_damping);
+                osc_torque = result.torque;
+                task_lambda = result.lambda;
             }
             const Eigen::Vector2d wrist_target
                 = ShapeWristTarget(raw_wrist_target, q_wrist);
-            Eigen::VectorXd null_error = q_reference - q;
-            // Wrist redundancy is commanded exactly once by the explicit
-            // distal tracker below. Feeding the same error into both this
-            // null-space controller and the tracker caused the old double
-            // stiffness and was a principal source of oscillation.
-            null_error.tail<2>().setZero();
-            const double operational_damping
-                = options.inertia_mode == "auto"
-                      ? AutomaticOperationalDamping(mass, jacobian)
-                      : 0.03;
-            auto result = OperationalSpaceTorque(mass, jacobian, error,
-                velocity_error, desired_acceleration, null_error, dq,
-                wrist_model.task_translation_kp,
-                wrist_model.task_translation_kd,
-                wrist_model.task_rotation_kp,
-                wrist_model.task_rotation_kd,
-                wrist_model.nullspace_kp,
-                wrist_model.nullspace_kd,
-                operational_damping);
             Eigen::VectorXd absolute_limit(9), rate_limit(9);
             absolute_limit.head<7>() = wrist_model.arm_torque_limit;
             absolute_limit.tail<2>() << 6.0, 2.0;
@@ -881,7 +1908,7 @@ struct Controller {
             const double torque_scale = SmoothRamp(
                 std::chrono::duration<double>(now - torque_ramp_started).count()
                 / torque_ramp_duration_s);
-            Eigen::VectorXd requested_torque = torque_scale * result.torque;
+            Eigen::VectorXd requested_torque = torque_scale * osc_torque;
             requested_torque.head<7>() += arm_coriolis;
             // The dynamically consistent null-space projection alone was
             // measured at only 0.1--0.2 Nm, below joint 8's identified
@@ -893,14 +1920,7 @@ struct Controller {
                     wrist_model.wrist_tracking_kp.cwiseProduct(
                        wrist_target - q_wrist)
                     - wrist_model.wrist_tracking_kd.cwiseProduct(dq_wrist));
-            const Eigen::Vector3d gravity_flange
-                = flange_rotation.transpose() * Eigen::Vector3d(0.0, 0.0, -9.80665);
-            const Eigen::Vector2d wrist_gravity
-                = -wrist_model.rigid_body_scale
-                  * (wrist.link1_linear_jacobian.transpose()
-                         * (wrist_model.mass1 * gravity_flange)
-                      + wrist.link2_linear_jacobian.transpose()
-                            * (wrist_model.mass2 * gravity_flange));
+            const Eigen::Vector2d wrist_gravity = dynamic_gravity.wrist;
             const Eigen::Vector2d friction_direction_velocity
                 = dq_wrist + 2.0 * (wrist_target - q_wrist);
             const Eigen::Vector2d wrist_friction
@@ -908,6 +1928,11 @@ struct Controller {
                   + wrist_model.coulomb_friction.cwiseProduct(
                         (friction_direction_velocity / 0.02).array().tanh().matrix())
                   + wrist_model.torque_bias;
+            // Flexiv retains its calibrated Elements gravity compensation at
+            // q8=q9=0. Add only the configuration-dependent change produced
+            // by the articulated wrist, so gravity is complete but never
+            // counted twice.
+            requested_torque.head<7>() += dynamic_gravity.arm_delta;
             requested_torque.tail<2>()
                 += wrist_gravity
                    + torque_scale
@@ -922,10 +1947,11 @@ struct Controller {
             // stiffness and was the main difference from stable Mode-2
             // teleoperation. Keep only slow physical gravity feed-forward in
             // hybrid mode. Pure-torque mode still receives the full OSC torque.
-            Eigen::Vector2d wrist_actuator_torque
-                = options.wrist_execution_mode == "hybrid_position_ff"
-                      ? wrist_gravity
-                      : torque.tail<2>();
+            Eigen::Vector2d wrist_actuator_torque = torque.tail<2>();
+            if (options.wrist_execution_mode == "hybrid_position_ff") {
+                wrist_actuator_torque
+                    = wrist_gravity + torque_scale * hybrid_force_feedforward;
+            }
             const Eigen::Vector2d wrist_absolute_limit(6.0, 2.0);
             for (int index = 0; index < 2; ++index) {
                 const double maximum_step
@@ -944,6 +1970,34 @@ struct Controller {
             wrist_io.WriteTorque(
                 {wrist_actuator_torque[0], wrist_actuator_torque[1]},
                 {wrist_target[0], wrist_target[1]});
+            last_position_error_m = error.head<3>().norm();
+            last_orientation_error_rad = error.tail<3>().norm();
+            if (teleop_io != nullptr) {
+                TeleopState teleop_state;
+                teleop_state.probe_pose = PoseArray(task_position, probe_rotation);
+                std::copy_n(states.ext_wrench_in_world.begin(), 6,
+                    teleop_state.external_wrench_world.begin());
+                teleop_state.wrist_q_rad = {q_wrist[0], q_wrist[1]};
+                teleop_state.mode = teleop_mode;
+                teleop_state.status_flags
+                    = (teleop_command_fresh ? 1U : 0U)
+                      | (teleop_enabled ? 2U : 0U)
+                      | (mode3_force_active ? 16U : 0U)
+                      | (mode3_position_recovery_active ? 32U : 0U);
+                teleop_state.probe_force_z_n = last_probe_force_z_n;
+                teleop_state.position_error_m = last_position_error_m;
+                teleop_state.orientation_error_rad
+                    = last_orientation_error_rad;
+                teleop_state.force_error_n = last_force_error_n;
+                teleop_state.arm_orientation_error_world = {
+                    last_arm_orientation_error_world.x(),
+                    last_arm_orientation_error_world.y(),
+                    last_arm_orientation_error_world.z()};
+                teleop_state.arm_singularity_sigma_min
+                    = last_arm_singularity_sigma_min;
+                teleop_state.arm_motion_scale = last_arm_motion_scale;
+                teleop_io->WriteState(teleop_state);
+            }
             if (log && cycle_count++ % 10 == 0) {
                 log << std::setprecision(10) << elapsed << ',' << error.head<3>().norm()
                     << ',' << error.tail<3>().norm() << ',' << dqa.norm() << ','
@@ -954,8 +2008,15 @@ struct Controller {
                     << wrist_actuator_torque[1]
                     << ',' << measured_torque[0] << ',' << measured_torque[1]
                     << ',' << SymmetricConditionNumber(mass) << ','
-                    << SymmetricConditionNumber(result.lambda) << ','
-                    << operational_damping << '\n';
+                    << SymmetricConditionNumber(task_lambda) << ','
+                    << operational_damping << ','
+                    << last_arm_singularity_sigma_min << ','
+                    << last_arm_motion_scale << ','
+                    << last_arm_orientation_error_world.x() << ','
+                    << last_arm_orientation_error_world.y() << ','
+                    << last_arm_orientation_error_world.z() << ','
+                    << dynamic_gravity.arm_delta.norm() << ','
+                    << wrist_gravity[0] << ',' << wrist_gravity[1] << '\n';
             }
         } catch (const std::exception& error) {
             std::cerr << "RT_ERROR " << error.what() << std::endl;
@@ -995,6 +2056,11 @@ int main(int argc, char** argv)
         std::signal(SIGINT, SignalHandler);
         std::signal(SIGTERM, SignalHandler);
         WristSharedMemory wrist_io(options.shared_memory);
+        std::unique_ptr<TeleopSharedMemory> teleop_io;
+        if (!options.teleop_shared_memory.empty()) {
+            teleop_io = std::make_unique<TeleopSharedMemory>(
+                options.teleop_shared_memory);
+        }
         const WristModel wrist_model = LoadWristModel(options.model_config);
         std::array<double, 2> qw {}, dqw {}, tw {};
         std::uint64_t wrist_age = 0;
@@ -1024,8 +2090,10 @@ int main(int argc, char** argv)
                       << SymmetricConditionNumber(tool_spatial) << std::endl;
         }
         const Eigen::Vector3d initial_task_offset
-            = options.endpoint == "pivot" ? wrist_model.joint1_origin
-                                            : wrist.position_flange;
+            = teleop_io != nullptr ? wrist.position_flange
+                                   : (options.endpoint == "pivot"
+                                             ? wrist_model.joint1_origin
+                                             : wrist.position_flange);
         const Eigen::Vector3d p0 = PosePosition(states.flange_pose)
                                    + PoseRotation(states.flange_pose)
                                          * initial_task_offset;
@@ -1037,13 +2105,59 @@ int main(int argc, char** argv)
             q_reference, Eigen::VectorXd::Zero(9), p0, r0,
             PoseRotation(states.flange_pose),
             std::chrono::steady_clock::now(), std::ofstream("/tmp/flexiv_9dof_osc_rt.csv")};
+        controller.teleop_io = teleop_io.get();
+        controller.force_bias_world = Eigen::Map<const Eigen::Vector3d>(
+            states.ext_wrench_in_world.data());
+        controller.ResetTeleopReference(p0, r0,
+            PoseRotation(states.flange_pose), wrist.rotation_flange,
+            q_wrist, Eigen::Map<const Eigen::VectorXd>(states.q.data(), 7),
+            TeleopControlMode::Hold, false, std::chrono::steady_clock::now());
         controller.log << "time_s,tip_position_error_m,orientation_error_rad,arm_dq_norm,"
                           "wrist_dq_norm,arm_tau_norm,wrist_tau_norm,q8_rad,q9_rad,"
                           "target_q8_rad,target_q9_rad,command_tau8_nm,command_tau9_nm,"
                           "applied_tau8_nm,applied_tau9_nm,mass_condition,lambda_condition,"
-                          "operational_damping\n";
+                          "operational_damping,arm_singularity_sigma_min,arm_motion_scale,"
+                          "arm_rotation_error_x_rad,arm_rotation_error_y_rad,"
+                          "arm_rotation_error_z_rad,arm_wrist_gravity_delta_norm_nm,"
+                          "wrist_gravity8_nm,wrist_gravity9_nm\n";
         if (options.inertia_mode == "legacy-block") {
             std::cerr << "WARNING legacy block-diagonal M omits arm/wrist coupling.\n";
+        }
+        std::cout
+            << "DYNAMIC_GRAVITY flexiv_internal_baseline=1 wrist_arm_delta="
+            << static_cast<int>(wrist_model.dynamic_wrist_gravity_compensation)
+            << " wrist_full=1 filter_hz="
+            << wrist_model.dynamic_gravity_filter_hz << std::endl;
+        if (teleop_io != nullptr) {
+            std::cout << "RT_TELEOP_READY modes=hold,7dof_osc,9dof_osc,"
+                         "orientation_force_osc rate_hz=1000 hold_frequency_hz="
+                      << wrist_model.clutch_hold_natural_frequency_hz
+                      << " hold_damping_ratio="
+                      << wrist_model.clutch_hold_damping_ratio
+                      << " mode3_fixed_xyz=1 mode3_position_kp="
+                      << wrist_model.mode3_position_kp
+                      << " mode3_position_kd="
+                      << wrist_model.mode3_position_kd
+                      << " wrist_first_allocation=1"
+                      << " mode2_position_priority=1"
+                      << " mode2_arm_max_angular_velocity_rad_s="
+                      << wrist_model.mode2_arm_max_angular_velocity_rad_s
+                      << " mode2_posture_reference_rate_per_s="
+                      << wrist_model.mode2_posture_reference_rate_per_s
+                      << " singularity_slow_sigma="
+                      << wrist_model.teleop_singularity_slow_sigma
+                      << " singularity_critical_sigma="
+                      << wrist_model.teleop_singularity_critical_sigma
+                      << " singularity_min_motion_scale="
+                      << wrist_model.teleop_singularity_min_motion_scale
+                      << " mode3_contact_gate_N="
+                      << wrist_model.mode3_contact_enable_threshold_n
+                      << " mode3_force_tolerance_N="
+                      << wrist_model.mode3_force_tolerance_n
+                      << " mode3_force_position_fade_m="
+                      << wrist_model.mode3_force_full_position_error_m << ':'
+                      << wrist_model.mode3_force_disable_position_error_m
+                      << std::endl;
         }
         rdk::Scheduler scheduler;
         scheduler.AddTask(std::bind(&Controller::Step, &controller), "9dof_osc_1khz",

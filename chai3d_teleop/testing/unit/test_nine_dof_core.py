@@ -5,8 +5,10 @@ from pathlib import Path
 import tomllib
 
 import numpy as np
+import scripts.teleoperate as teleoperate_module
 
 from controllers.nine_dof import (
+    Mode3ForceGate,
     PedalModeStateMachine,
     TeleopMode,
     WristGeometry,
@@ -14,6 +16,7 @@ from controllers.nine_dof import (
     allocate_wrist_orientation,
     axis_angle_rotation,
     flange_target_for_probe,
+    flange_target_for_probe_decoupled,
     operational_space_wrist_torque,
     orientation_only_target,
     parse_runtime_mode_command,
@@ -26,7 +29,7 @@ from controllers.nine_dof import (
     wrist_gravity_compensation,
 )
 from controllers.teleop import HapticSample, MappingConfig, RelativePoseMapper, parse_axis_map
-from scripts.teleoperate import DEFAULT_CONFIG, load_profile
+from scripts.teleoperate import DEFAULT_CONFIG, build_ui_telemetry, load_profile
 
 
 def geometry() -> WristGeometry:
@@ -48,6 +51,152 @@ def test_saved_common_safe_loop_demo_profile_is_accepted() -> None:
     assert demo["trajectory"] == "loop"
     assert demo["radius_m"] == 0.010
     assert demo["orientation_amplitude_deg"] == 35.0
+    identification = profile.document["inertia_identification"]
+    assert identification["duration_s"] == 120.0
+    assert identification["amplitude_deg"] == [45.0, 60.0]
+    assert profile.runtime["teleop_controller"] == "flexiv_impedance"
+    assert profile.runtime["ui_telemetry_rate_hz"] == 20.0
+    assert profile.teleop_impedance["stiffness_scale"] == [
+        0.25,
+        0.25,
+        0.25,
+        0.35,
+        0.35,
+        0.35,
+    ]
+    assert profile.teleop_impedance["released_stiffness_scale"] == [
+        0.04,
+        0.04,
+        0.04,
+        0.08,
+        0.08,
+        0.08,
+    ]
+    assert profile.teleop_impedance["mode3_stiffness_scale"] == [
+        0.35,
+        0.35,
+        0.35,
+        0.20,
+        0.20,
+        0.20,
+    ]
+    assert profile.osc["force_axis_max_velocity_m_s"] == 0.005
+    assert profile.osc["force_command_ramp_s"] == 3.0
+    assert profile.wrist["drive_watchdog_ms"] == 1000.0
+    assert profile.allocation["teleop_wrist_max_tracking_lead_deg"] == [
+        15.0,
+        15.0,
+    ]
+
+
+def test_default_real_teleop_dispatches_to_flexiv_impedance(monkeypatch) -> None:
+    profile = load_profile(DEFAULT_CONFIG)
+    calls: list[tuple[object, object, bool]] = []
+
+    def fake_impedance(selected_profile, mode3_force_n, *, ui_control_stdin):
+        calls.append((selected_profile, mode3_force_n, ui_control_stdin))
+        return 23
+
+    monkeypatch.setattr(
+        teleoperate_module, "_run_real_nrt_legacy", fake_impedance
+    )
+    result = teleoperate_module._run_real(
+        profile, None, ui_control_stdin=True
+    )
+
+    assert result == 23
+    assert calls == [(profile, None, True)]
+
+
+def test_ui_telemetry_reports_probe_and_all_nine_joint_errors() -> None:
+    actual = np.eye(4)
+    actual[:3, 3] = [0.10, -0.20, 0.30]
+    target = np.eye(4)
+    target[:3, :3] = axis_angle_rotation(np.array([0.0, 0.0, 1.0]), math.radians(5.0))
+    target[:3, 3] = [0.102, -0.203, 0.304]
+    arm_actual = np.deg2rad(np.arange(7, dtype=float))
+    arm_reference = arm_actual + math.radians(1.0)
+    wrist_actual = np.deg2rad([10.0, -20.0])
+    wrist_target = np.deg2rad([12.0, -23.0])
+
+    sample = build_ui_telemetry(
+        timestamp_s=1.25,
+        mode=TeleopMode.ARM_WRIST_9DOF,
+        enabled=True,
+        actual_probe_world=actual,
+        target_probe_world=target,
+        arm_actual_q_rad=arm_actual,
+        arm_reference_q_rad=arm_reference,
+        wrist_actual_q_rad=wrist_actual,
+        wrist_target_q_rad=wrist_target,
+        force_measured_tool_z_n=-13.8,
+        force_estimated_tool_z_n=-14.2,
+        force_target_tool_z_n=-15.0,
+        force_command_tool_z_n=-14.5,
+        force_control_active=True,
+    )
+
+    assert np.allclose(sample["position_error_mm"], [2.0, -3.0, 4.0])
+    assert math.isclose(sample["position_error_norm_mm"], math.sqrt(29.0))
+    assert np.allclose(sample["orientation_error_rotvec_deg"], [0.0, 0.0, 5.0])
+    assert len(sample["joint_error_deg"]) == 9
+    assert np.allclose(sample["joint_error_deg"][:7], np.ones(7))
+    assert np.allclose(sample["joint_error_deg"][7:], [2.0, -3.0])
+    assert sample["arm_joint_target_kind"] == "nullspace_reference"
+    assert sample["force_measured_tool_z_n"] == -13.8
+    assert sample["force_estimated_tool_z_n"] == -14.2
+    assert sample["force_target_tool_z_n"] == -15.0
+    assert sample["force_command_tool_z_n"] == -14.5
+    assert sample["force_control_active"] is True
+
+
+def test_controller_parser_keeps_explicit_torque_osc_choice() -> None:
+    args = teleoperate_module.build_parser().parse_args(
+        ["--controller", "torque-osc"]
+    )
+    assert args.controller == "torque-osc"
+
+
+def test_mode3_force_gate_waits_for_contact_then_ramps_gently() -> None:
+    gate = Mode3ForceGate(
+        target_force_n=-15.0,
+        contact_enable_threshold_n=2.0,
+        contact_release_threshold_n=1.0,
+        contact_release_delay_s=0.05,
+        force_ramp_s=3.0,
+    )
+    waiting = gate.update(-0.5, teleoperation_enabled=True, now_s=10.0)
+    assert not waiting.force_axis_enabled
+    assert waiting.commanded_force_n == 0.0
+
+    acquired = gate.update(-2.5, teleoperation_enabled=True, now_s=11.0)
+    assert acquired.force_axis_enabled
+    assert acquired.changed
+    assert acquired.commanded_force_n == -2.5
+
+    halfway = gate.update(-3.0, teleoperation_enabled=True, now_s=12.5)
+    assert halfway.force_axis_enabled
+    assert math.isclose(halfway.commanded_force_n, -8.75)
+
+    settled = gate.update(-15.0, teleoperation_enabled=True, now_s=15.0)
+    assert settled.commanded_force_n == -15.0
+
+
+def test_mode3_force_gate_releases_after_persistent_contact_loss() -> None:
+    gate = Mode3ForceGate(
+        target_force_n=-15.0,
+        contact_enable_threshold_n=2.0,
+        contact_release_threshold_n=1.0,
+        contact_release_delay_s=0.05,
+        force_ramp_s=3.0,
+    )
+    gate.update(-3.0, teleoperation_enabled=True, now_s=1.0)
+    transient = gate.update(-0.2, teleoperation_enabled=True, now_s=2.0)
+    assert transient.force_axis_enabled
+    lost = gate.update(-0.2, teleoperation_enabled=True, now_s=2.06)
+    assert not lost.force_axis_enabled
+    assert lost.changed
+    assert lost.reason == "contact_lost"
 
 
 def test_runtime_ui_mode_commands_map_to_the_same_three_modes() -> None:
@@ -115,6 +264,19 @@ def test_mode_change_while_clutched_requires_release() -> None:
     assert state.teleoperation_enabled(True)
 
 
+def test_mode_state_can_be_cleared_to_a_disabled_hold() -> None:
+    state = PedalModeStateMachine()
+    state.select(TeleopMode.ARM_WRIST_9DOF, clutch_pressed=False)
+    assert state.teleoperation_enabled(True)
+
+    transition = state.clear()
+    assert transition.changed
+    assert transition.selected_mode is None
+    assert not transition.ready
+    assert not state.teleoperation_enabled(True)
+    assert not state.observe_clutch(False).ready
+
+
 def test_joint9_remains_stopped_until_selected_mode_has_engaged() -> None:
     assert wrist_hold_axes(None, False) == (False, False)
     assert wrist_hold_axes(TeleopMode.ARM_7DOF, False) == (True, False)
@@ -157,6 +319,65 @@ def test_flange_compensation_reconstructs_exact_probe_target() -> None:
     flange = flange_target_for_probe(target, model, q)
     reconstructed = probe_pose_from_flange(flange, model, q)
     assert np.allclose(reconstructed, target, atol=1e-10)
+
+
+def test_mode2_joint8_rotation_keeps_tcp_fixed_without_arm_rotation() -> None:
+    model = geometry()
+    q_target = np.array([math.radians(25.0), 0.0])
+    initial_probe = model.forward(np.zeros(2))
+    target_probe = initial_probe.copy()
+    target_probe[:3, :3] = model.forward(q_target)[:3, :3]
+
+    flange = flange_target_for_probe(target_probe, model, q_target)
+    reconstructed = probe_pose_from_flange(flange, model, q_target)
+
+    # Joint 8 supplies all requested orientation, so the Flexiv flange does
+    # not rotate. It only translates slightly to cancel the offset-tip arc.
+    assert np.allclose(flange[:3, :3], np.eye(3), atol=1e-10)
+    assert np.linalg.norm(flange[:3, 3]) > 1e-3
+    assert np.allclose(
+        reconstructed[:3, 3], initial_probe[:3, 3], atol=1e-10
+    )
+    assert np.allclose(
+        reconstructed[:3, :3], target_probe[:3, :3], atol=1e-10
+    )
+
+
+def test_mode2_slow_joint_keeps_tcp_position_without_arm_rotation() -> None:
+    model = geometry()
+    desired_q = np.array([math.radians(25.0), 0.0])
+    measured_q = np.array([math.radians(8.0), 0.0])
+    initial_probe = model.forward(np.zeros(2))
+    target_probe = initial_probe.copy()
+    target_probe[:3, :3] = model.forward(desired_q)[:3, :3]
+
+    flange = flange_target_for_probe_decoupled(
+        target_probe, model, desired_q, measured_q
+    )
+    live_probe = probe_pose_from_flange(flange, model, measured_q)
+
+    # Desired q8 owns all target rotation, so Flexiv does not rotate while the
+    # physical wrist catches up. Its small translation keeps live TCP exact.
+    assert np.allclose(flange[:3, :3], np.eye(3), atol=1e-10)
+    assert np.allclose(
+        live_probe[:3, 3], target_probe[:3, 3], atol=1e-10
+    )
+    assert not np.allclose(
+        live_probe[:3, :3], target_probe[:3, :3], atol=1e-4
+    )
+
+
+def test_mode1_xz_rotation_sign_is_reversed_from_mode2() -> None:
+    profile = load_profile(DEFAULT_CONFIG)
+    mode2_sign = np.asarray(
+        profile.haptic["rotation_command_sign"], dtype=float
+    )
+    mode1_sign = np.asarray(
+        profile.haptic["mode1_rotation_command_sign"], dtype=float
+    )
+    assert np.array_equal(mode2_sign, [-1.0, -1.0, 1.0])
+    assert np.array_equal(mode1_sign, [-1.0, 1.0, 1.0])
+    assert mode1_sign[1] == -mode2_sign[1]
 
 
 def test_flexiv_world_force_is_projected_by_live_probe_orientation() -> None:

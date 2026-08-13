@@ -488,7 +488,7 @@ class StableHapticFeedback:
 
 @dataclass(frozen=True)
 class MappingConfig:
-    translation_scale: float = 0.5
+    translation_scale: float = 1.0
     translation_deadband_m: float = 0.0
     rotation_deadband_rad: float = 0.0
     # None disables the per-clutch displacement range check.
@@ -580,7 +580,13 @@ class RelativePoseMapper:
         target = self._robot_anchor.copy()
         target[:3] += delta_world
         if self.config.enable_rotation:
-            relative_device = sample.rotation @ self._device_anchor.rotation.T
+            # Measure orientation in the handle frame captured on the clutch
+            # edge.  The former space-frame delta (R * R0.T) mixed pitch,
+            # roll and yaw whenever the omega.7 was engaged away from the
+            # identity attitude.  Body-frame relative motion (R0.T * R) gives
+            # the operator the same local forward/back and left/right axes at
+            # every clutch re-capture.
+            relative_device = self._device_anchor.rotation.T @ sample.rotation
             angle = math.acos(float(np.clip((np.trace(relative_device) - 1.0) / 2.0, -1.0, 1.0)))
             if (
                 self.config.max_rotation_rad is not None
@@ -625,7 +631,9 @@ class RelativePoseMapper:
                 mapped_vector * self.rotation_command_sign
             )
             robot_rotation = quaternion_to_matrix(self._robot_anchor[3:])
-            target[3:] = matrix_to_quaternion(mapped_relative @ robot_rotation)
+            # The mapped delta is likewise local to the captured probe TCP.
+            # Post-multiplication is the matching body-frame composition.
+            target[3:] = matrix_to_quaternion(robot_rotation @ mapped_relative)
 
         if self._last_target is not None:
             step = target[:3] - self._last_target[:3]

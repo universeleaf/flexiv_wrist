@@ -80,3 +80,38 @@ def test_gravity_compensation_reverses_with_flange_upside_down() -> None:
     upside_down = np.diag([1.0, -1.0, -1.0])
     inverted = model.gravity_compensation(q, upside_down)
     assert np.allclose(inverted, -normal, atol=1e-10)
+
+
+def test_dynamic_gravity_partitions_arm_delta_and_full_wrist_torque() -> None:
+    model = _model()
+    # A nontrivial arm Jacobian makes movement of the wrist CoMs visible as a
+    # seven-axis gravity correction. Values are synthetic but kinematically
+    # representative and keep this test independent from real hardware.
+    flange_jacobian = np.zeros((6, 7))
+    flange_jacobian[:3, :3] = np.eye(3)
+    flange_jacobian[3:, 3:6] = np.eye(3)
+    rotation = np.eye(3)
+
+    arm_zero, wrist_zero = model.dynamic_gravity_compensation(
+        np.zeros(2), rotation, flange_jacobian
+    )
+    assert np.allclose(arm_zero, np.zeros(7), atol=1e-12)
+    assert np.allclose(
+        wrist_zero,
+        model.gravity_compensation(np.zeros(2), rotation),
+        atol=1e-12,
+    )
+
+    q = np.array([0.55, -0.8])
+    arm_delta, wrist = model.dynamic_gravity_compensation(
+        q, rotation, flange_jacobian
+    )
+    full = model.full_generalized_gravity_compensation(
+        q, rotation, flange_jacobian
+    )
+    zero_full = model.full_generalized_gravity_compensation(
+        np.zeros(2), rotation, flange_jacobian
+    )
+    assert np.linalg.norm(arm_delta) > 1e-4
+    assert np.allclose(arm_delta, full[:7] - zero_full[:7], atol=1e-12)
+    assert np.allclose(wrist, full[7:], atol=1e-12)

@@ -64,4 +64,12 @@ if(BUILD_FLEXIV_RT_OSC)
     # DT_RUNPATH is not searched for indirect dependencies by glibc.
     target_link_options(${target} PRIVATE "LINKER:--disable-new-dtags")
   endforeach()
+  add_executable(test_position_priority_osc
+    testing/cpp/test_position_priority_osc.cpp)
+  target_compile_features(test_position_priority_osc PRIVATE cxx_std_17)
+  target_compile_options(test_position_priority_osc PRIVATE
+    -Wall -Wextra -Wpedantic)
+  target_include_directories(test_position_priority_osc PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/controllers/cpp")
+  target_link_libraries(test_position_priority_osc PRIVATE flexiv::flexiv_rdk)
 endif()

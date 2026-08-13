@@ -179,17 +179,18 @@ def collect(
                 # Deliberately visible, incommensurate multi-sine excitation.
                 # The old 3/5 degree waveform was dominated by reducer static
                 # friction, so its regression could not identify real inertia.
-                # These components stay below the configured 45 deg/s and
-                # 180 deg/s^2 position-profile limits for the new 15/30 deg
-                # defaults while exciting q, dq and ddq independently.
+                # Frequencies are deliberately lower than the old waveform so
+                # the larger 45/60 degree defaults remain around/below the
+                # commissioned motion speed while still exciting q, dq and
+                # ddq independently over the longer 120 second collection.
                 q_target = center + envelope * np.array(
                     [
                         amplitudes[0]
-                        * (0.72 * math.sin(2 * math.pi * 0.13 * elapsed)
-                           + 0.28 * math.sin(2 * math.pi * 0.31 * elapsed)),
+                        * (0.72 * math.sin(2 * math.pi * 0.10 * elapsed)
+                           + 0.28 * math.sin(2 * math.pi * 0.23 * elapsed)),
                         amplitudes[1]
-                        * (0.68 * math.sin(2 * math.pi * 0.17 * elapsed + 0.8)
-                           + 0.32 * math.sin(2 * math.pi * 0.37 * elapsed)),
+                        * (0.68 * math.sin(2 * math.pi * 0.085 * elapsed + 0.8)
+                           + 0.32 * math.sin(2 * math.pi * 0.185 * elapsed)),
                     ]
                 )
                 wrist.command_position(q_target)
@@ -494,13 +495,13 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--analyze", type=Path, metavar="CSV")
     action.add_argument("--monitor", action="store_true")
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "config" / "wrist_inertia_calibration.json")
-    parser.add_argument("--duration-s", type=float, default=90.0)
+    parser.add_argument("--duration-s", type=float, default=120.0)
     parser.add_argument(
         "--amplitude-deg",
         nargs=2,
         type=float,
-        default=[15.0, 30.0],
-        help="joint8 joint9 peak excitation; default is a clearly visible 15/30 deg",
+        default=[45.0, 60.0],
+        help="joint8 joint9 peak excitation; default is a clearly visible 45/60 deg",
     )
     parser.add_argument(
         "--position-kp-scale",

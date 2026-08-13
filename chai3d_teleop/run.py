@@ -27,7 +27,8 @@ def main() -> int:
     parser.add_argument(
         "command",
         choices=(
-            "demo7", "demo9", "teleop", "set-zero", "go-zero", "home",
+            "demo7", "demo9", "teleop", "teleop-impedance", "teleop-osc",
+            "set-zero", "go-zero", "home",
             "identify-inertia", "dynamic-inertia", "check-inertia", "check-tool", "apply-pid",
             "ui", "build", "test",
         ),
@@ -50,6 +51,12 @@ def main() -> int:
         "demo7": [py, "-m", "scripts.demo_7dof", *common_demo, "--confirm", "RUN_7DOF_TORQUE_OSC"],
         "demo9": [py, "-m", "scripts.demo_9dof", *common_demo, "--confirm", "RUN_9DOF_TORQUE_OSC"],
         "teleop": [py, "-m", "scripts.teleoperate"],
+        "teleop-impedance": [
+            py, "-m", "scripts.teleoperate", "--controller", "flexiv-impedance"
+        ],
+        "teleop-osc": [
+            py, "-m", "scripts.teleoperate", "--controller", "torque-osc"
+        ],
         "set-zero": [str(MOTEUS_PY), "-m", "tools.set_wrist_zero", "--confirm-set-zero", "SET_CURRENT_WRIST_ZERO"],
         "go-zero": [py, "-m", "tools.move_wrist_zero"],
         "home": [py, "-m", "tools.home_system"],
@@ -63,7 +70,10 @@ def main() -> int:
         "test": [py, "-m", "pytest", "-q", "testing/unit"],
     }
     command = commands[args.command]
-    if args.command in {"demo7", "demo9", "teleop", "go-zero", "home", "identify-inertia", "dynamic-inertia", "apply-pid"}:
+    if args.command in {
+        "demo7", "demo9", "teleop", "teleop-impedance", "teleop-osc",
+        "go-zero", "home", "identify-inertia", "dynamic-inertia", "apply-pid",
+    }:
         print("REAL HARDWARE TASK: workspace clear, active Tool correct, E-stop reachable.")
     return _run(command)
 

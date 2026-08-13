@@ -10,24 +10,46 @@ max_angular_velocity_rad_s = 1.0
 max_linear_acceleration_m_s2 = 2.0
 max_angular_acceleration_rad_s2 = 5.0
 
+[home]
+# Flexiv's documented Rizon 4(s) default Home joint pose. The program evaluates
+# this pose with the live calibrated RDK model; it never drives through the low
+# official Home point when using the long TCP.
+reference_joint_position_deg = [0.0, -40.0, 0.0, 90.0, 0.0, 40.0, 0.0]
+# Direct Cartesian destination: FK(reference_joint_position_deg), transformed
+# to the active Tool TCP, then translated 200 mm along world +Z. X/Y and
+# orientation remain those of the documented Home pose.
+final_lift_world_z_m = 0.20
+# A conservative 50 mm/s makes the direct safe-Home move easy to observe/stop.
+final_lift_max_linear_velocity_m_s = 0.05
+final_lift_max_linear_acceleration_m_s2 = 0.20
+# Stop only after the measured active TCP remains within 3 mm of the elevated
+# final target for 0.30 s.
+final_lift_position_tolerance_m = 0.003
+final_lift_settle_s = 0.30
+final_lift_timeout_s = 15.0
+command_rate_hz = 100.0
+
 [haptic]
 device = 0
 switch = 0
 device_rate_hz = 1000
 watchdog_ms = 100.0
-translation_scale = 2.0
+translation_scale = 1.0
 axis_map = "-x,-y,z"
-# Rotation is configured independently from translation. omega.7 device +X
-# points forward, +Y points right, and +Z points up. Forward/back handle pitch
-# is rotation about device Y and must remain a robot-Y rotation so it primarily
-# drives joint 8. Left/right handle roll is rotation about device X and remains
-# a robot-X rotation. Negating X and Y preserves the commissioned directions
-# and forms a proper right-handed map; the yaw sign is handled separately.
+# Rotation is configured independently from translation. The mapper now takes
+# the body-frame rotation relative to the handle pose captured at the clutch
+# edge, so engaging the omega.7 at a tilted attitude cannot mix forward/back,
+# left/right and yaw. omega.7 device +X points forward, +Y points right and +Z
+# points up. Negating X and Y preserves the commissioned directions and forms
+# a proper right-handed map; the yaw sign is handled separately.
 rotation_axis_map = "-x,-y,z"
-# Reverse only the mapped yaw command: rotating the handle left now commands
-# the Flexiv/end effector left. Joint-8 forward/back pitch and translation are
-# unchanged.
-rotation_command_sign = [1.0, 1.0, -1.0]
+# Reverse left/right handle rotation in the Y-Z plane, i.e. rotation about the
+# mapped local X axis. The Y/Z rotation directions and translation are unchanged.
+rotation_command_sign = [-1.0, -1.0, 1.0]
+# Mode 1 only: reverse rotation in the X-Z plane (rotation about local Y).
+# Mode 2 keeps the commissioned mapping above because its local Y component is
+# allocated primarily to joint 8.
+mode1_rotation_command_sign = [-1.0, 1.0, 1.0]
 gravity_compensation = true
 # This local omega.7 damping is retained to suppress bilateral oscillation.
 teleop_damping_n_per_m_s = 12.0
@@ -74,6 +96,11 @@ rt_osc_bridge_rate_hz = 50.0
 # in the UI if the USB adapter occasionally takes longer to respond.
 command_timeout_s = 4.0
 watchdog_ms = 100.0
+# moteus' own per-command watchdog must be longer than one complete sequential
+# ID2+ID1 fdcanusb transaction. The bridge still enforces the 100 ms upstream
+# command watchdog and sends STOP on process exit; this 1 s value only prevents
+# normal USB/CAN jitter from putting the drive into mode=11 (TIMEOUT).
+drive_watchdog_ms = 1000.0
 # The real-time 9-DoF demo crosses a non-RT Python + USB/CAN-FD bridge.  Use a
 # larger freshness/command window there so normal scheduling jitter does not
 # look like a disconnected wrist.  Genuine stale state still causes a STOP.
@@ -158,7 +185,7 @@ trajectory = "loop"
 # small closed position loop.
 endpoint = "pivot"
 period_s = 20.0
-radius_m = 0.010
+radius_m = 0.01
 # The loop uses approximately [0.10A, 1.00A, 0.85A] on three harmonics. A=35
 # gives clear q8/q9 excursions while remaining far from the 180-degree branch.
 orientation_amplitude_deg = 35.0
@@ -210,6 +237,16 @@ inertia_calibration_path = "wrist_inertia_calibration.json"
 # A new physical assembly must pass identify-inertia + check-inertia first.
 require_identified_inertia = true
 
+[inertia_identification]
+# Wrist-only parameter identification. The Flexiv 7-DoF dynamics remain the
+# calibrated RDK/Elements model and are coupled with this result into M9(q) at
+# runtime. Larger, slower excitation improves signal-to-friction ratio without
+# asking the geared axes to exceed their commissioned motion profile.
+duration_s = 120.0
+amplitude_deg = [45.0, 60.0]
+position_kp_scale = [0.35, 0.35]
+position_kd_scale = [1.0, 1.0]
+
 [flexiv_tool]
 # Probe was removed and the no-probe assembly was recalibrated in Elements on
 # 2026-08-10. The read-only check reported a 3.019 N unloaded compensated
@@ -246,6 +283,11 @@ wrist_tracking_kd_nm_s_per_rad = [0.8, 0.35]
 wrist_target_filter_hz = 1.5
 wrist_target_max_velocity_deg_s = [30.0, 40.0]
 wrist_target_max_acceleration_deg_s2 = [120.0, 160.0]
+# A moving following window, not a joint-range restriction. The commanded
+# q8/q9 target can keep advancing through the complete physical range as the
+# measured joint moves, but it cannot accumulate a large lead that makes the
+# bridge abort or drives continuously against an obstruction.
+teleop_wrist_max_tracking_lead_deg = [15.0, 15.0]
 # The USB/CAN-FD wrist state arrives near 50 Hz while Flexiv OSC runs at
 # 1 kHz. Low-pass the repeated/noisy wrist velocity before it enters the task
 # damping and inverse dynamics; position remains the live measured value.
@@ -279,35 +321,192 @@ nullspace_kd = 2.0
 arm_torque_limit_nm = [20.0, 20.0, 15.0, 15.0, 8.0, 8.0, 5.0]
 arm_torque_slew_nm_s = [200.0, 200.0, 150.0, 150.0, 80.0, 80.0, 50.0]
 wrist_torque_slew_nm_s = [15.0, 8.0]
+# Flexiv continues compensating the calibrated Elements Tool at the wrist-zero
+# pose. At 1 kHz the controller adds the live-minus-zero gravity torque caused
+# by q8/q9 motion to the seven arm commands; q8/q9 receive their full modeled
+# gravity torque. This makes the articulated wrist dynamic without applying the
+# zero-pose payload twice.
+# GitHub Mode-1/2 baseline: Flexiv/Elements performs the complete calibrated
+# arm-side gravity compensation. Do not add the later experimental q8/q9
+# live-minus-zero torque to the seven Flexiv joints.
+dynamic_wrist_gravity_compensation = false
+# q8/q9 encoder samples arrive much more slowly than the 1 kHz Flexiv loop.
+# Filter only the model-based gravity feed-forward so sample quantization does
+# not become a 1 kHz torque step. The underlying joint state stays unmodified.
+dynamic_gravity_filter_hz = 5.0
+
+[teleop_impedance]
+# Mode 1/2 default test backend: Flexiv's own NRT Cartesian
+# motion/force controller.  The six values scale the nominal translational
+# and rotational stiffness supplied by the connected robot model; they do not
+# replace the calibrated Flexiv dynamics or gravity compensation.
+stiffness_scale = [0.25, 0.25, 0.25, 0.35, 0.35, 0.35]
+# With the clutch released, keep the captured TCP as the equilibrium point but
+# make the virtual spring soft enough to move easily by hand. Releasing the
+# external force returns the TCP to that equilibrium instead of teaching a new
+# target. These scales are intentionally much lower than the active values.
+released_stiffness_scale = [0.04, 0.04, 0.04, 0.08, 0.08, 0.08]
+# Flexiv accepts damping ratios rather than raw Cartesian damping gains.
+# 0.70 is the RDK default and is used on all six task axes.
+damping_ratio = [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+# Mode 3 uses a gentle hybrid operational-space controller in the same Flexiv
+# session. X/Y keep the captured contact point firmly, the force-controlled Z
+# axis may move only as needed to regulate contact, and orientation stays softer
+# so a wrist command cannot provoke an abrupt whole-arm rotation.
+mode3_stiffness_scale = [0.35, 0.35, 0.35, 0.2, 0.2, 0.2]
+mode3_damping_ratio = [0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
+mode3_nullspace_reference_tracking = 1.0
+# Keep the arm close to the joint posture captured when the clutch is pressed.
+# This prevents a redundant Cartesian solution from wandering toward a remote
+# posture while Mode 2 lets q8/q9 take the reachable orientation first.
+nullspace_linear_manipulability = 0.0
+nullspace_angular_manipulability = 0.0
+nullspace_reference_tracking = 1.0
+# Reduce redundant joint-posture resistance during hand-guided deflection.
+released_nullspace_reference_tracking = 0.1
+
+[teleop_osc]
+# All three teleoperation modes run in the C++ 1 kHz RT_JOINT_TORQUE loop.
+# Python only publishes targets and services omega.7/pedals/moteus.
+inertia_mode = "auto"
+cpu_affinity = 2
+# A short Python/USB scheduling delay must not permanently disarm teleoperation.
+# The C++ loop holds only while a command is actually stale and automatically
+# resumes from the measured pose when fresh data returns.
+command_timeout_ms = 500.0
+# OSC-only target shaper. Mode-1/2 gains and motion rates below are restored
+# from the published GitHub controller/configuration values.
+target_filter_hz = 8.0
+# GitHub [robot] rates, now enforced by the 1 kHz OSC target shaper.
+max_linear_velocity_m_s = 0.5
+max_linear_acceleration_m_s2 = 2.0
+max_angular_velocity_rad_s = 1.0
+max_angular_acceleration_rad_s2 = 5.0
+# GitHub [osc_controller] impedance gains, reused by real-time teleoperation.
+arm_translation_kp = 80.0
+arm_translation_kd = 22.0
+arm_rotation_kp = 45.0
+arm_rotation_kd = 14.0
+# Mode 2 is deliberately asymmetric: q8/q9 first take every reachable
+# orientation component at the true 1:1 angle, while the Flexiv arm supplies
+# only the third-axis residual. The residual target is slower and softer than
+# Mode 1 so a small wrist-unreachable rotation cannot trigger a large whole-arm
+# reconfiguration.
+mode2_arm_rotation_kp = 18.0
+mode2_arm_rotation_kd = 8.0
+mode2_arm_max_angular_velocity_rad_s = 0.2
+mode2_arm_max_angular_acceleration_rad_s2 = 0.6
+# Keep the redundant arm posture captured at clutch engagement. Zero freezes
+# that reference during Mode 2; it does not freeze the Cartesian task and does
+# not impose a stop/abort threshold.
+mode2_posture_reference_rate_per_s = 0.0
+# GitHub [allocation] wrist target shaper, reused by Mode 2.
+teleop_wrist_target_filter_hz = 1.5
+teleop_wrist_target_max_velocity_deg_s = [30.0, 40.0]
+teleop_wrist_target_max_acceleration_deg_s2 = [120.0, 160.0]
+# The C++ second-order target shaper already creates a coherent desired
+# velocity. Disable finite-difference feed-forward from the slower Python
+# samples; it previously amplified one-frame device/USB jumps.
+target_velocity_feedforward_gain = 0.0
+# Near a kinematic singularity the ordinary 0.20 OSC regularization was
+# insufficient (recorded task-inertia condition numbers exceeded 10,000).
+# Teleoperation may use stronger damping only where the live Jacobian requires
+# it; well-conditioned motion is unchanged.
+# Published OSC regularization/damping value in well-conditioned free space.
+max_operational_damping = 0.03
+# Geometry-based singularity monitor. Angular Jacobian rows are converted to
+# equivalent linear motion using this characteristic length. As sigma_min
+# falls from slow_sigma toward critical_sigma, only Flexiv's target speed is
+# reduced continuously; q8/q9 keep their natural 1:1 command. The process does
+# not abort, and minimum_motion_scale preserves authority to move/reclutch away.
+singularity_characteristic_length_m = 0.25
+singularity_slow_sigma = 0.05
+singularity_critical_sigma = 0.015
+singularity_min_motion_scale = 0.15
+# Mode 1: in well-conditioned motion, let the null-space reference follow the
+# measured arm slowly (0.1/s ~= 10 s time constant). Mode 2 uses its dedicated
+# zero rate above. Every mode freezes the latest healthy reference near a
+# singularity instead of accepting a worse posture on every reclutch.
+posture_reference_rate_per_s = 0.1
+# Releasing the omega.7 clutch captures the current measured arm joints and
+# enters a mass-matrix-shaped hold. A 1 Hz natural frequency is substantially
+# harder than the old fixed-gain hold; damping ratio 1.25 is over-damped, so it
+# returns without the old bounce. No integral term is used, avoiding wind-up
+# while a person intentionally deflects the arm.
+clutch_hold_natural_frequency_hz = 1.0
+clutch_hold_damping_ratio = 1.25
+# Mode 3 locks the complete XYZ contact point captured at clutch engagement.
+# Haptic translation is discarded in both Python and C++. Orientation is the
+# only operator command. The Tool-Z force loop is subordinate to this position
+# task: if the point starts moving, the force term fades out and position OSC
+# returns it to the captured point; this never exits the mission.
+mode3_position_kp = 160.0
+mode3_position_kd = 32.0
+# Mode 3 uses a hierarchical allocation: q8/q9 own the two reachable probe
+# orientation directions. The Flexiv arm only compensates the moving wrist-tip
+# position and a small residual flange rotation that q8/q9 cannot produce.
+mode3_arm_rotation_kp = 18.0
+mode3_arm_rotation_kd = 8.0
+# Only the orientation component that q8/q9 cannot generate is assigned to
+# Flexiv. Limit that residual arm motion independently from Mode 1/2 so an
+# orientation command cannot trigger a fast whole-arm reconfiguration around
+# the contact point. Wrist target rates remain unchanged and natural 1:1.
+mode3_arm_max_angular_velocity_rad_s = 0.2
+mode3_arm_max_angular_acceleration_rad_s2 = 0.6
+# Do not let the -15 N controller search for a surface in free space. Force
+# control latches on only when the measured Tool-Z force already has the target
+# sign and exceeds this threshold. Make contact manually before clutching Mode 3.
+mode3_contact_enable_threshold_n = 2.0
+# If contact is genuinely lost for 50 ms, remove the autonomous force term and
+# keep holding the captured point. Gentle contact can latch it again. This is a
+# controller state transition, not a script-stop condition.
+mode3_contact_release_threshold_n = 1.0
+mode3_contact_release_delay_s = 0.05
+# A 1 N force deadband means any measured Tool-Z reaction from 14 to 16 N is
+# accepted for the -15 N target. Inside this band the integral decays instead
+# of chasing sensor noise.
+mode3_force_tolerance_n = 1.0
+# Fixed point has priority over force. Full force is allowed while the modeled
+# TCP is within 1 mm of its captured point, fades smoothly from 1 to 3 mm, and
+# is zero beyond 3 mm so position OSC can recover the point without fighting
+# an autonomous contact-search wrench. No haptic translation is ever admitted.
+mode3_force_full_position_error_m = 0.001
+mode3_force_disable_position_error_m = 0.003
+# These are contact-controller gains, not haptic-feedback gains. The output is
+# bounded at the task-force level before actuator torque ratings are applied.
+mode3_force_kp = 0.25
+mode3_force_ki_per_s = 0.35
+mode3_force_damping_n_s_m = 25.0
+mode3_force_integral_limit_n = 8.0
+mode3_force_command_limit_n = 30.0
 
 [pivot_orientation_osc]
-# Rotational task-space impedance for the two wrist motors. The task moment is
-# m = K_R*orientation_error - D_R*angular_velocity, then tau = Jw^T*m + gravity.
-# These physical N.m gains replace the old acceleration/inertia formulation,
-# which generated only millinewton-metre commands and could not overcome the
-# geared wrist's static friction. Both values are editable in the UI.
+# Default unified Mode-3 wrist OSC outer-loop gains. The resulting q8/q9 target
+# is tracked by moteus' stable position loop while this modeled torque is added
+# as feed-forward; Flexiv remains in its hybrid Cartesian controller.
 rotational_stiffness_nm_per_rad = 6.0
 rotational_damping_nm_s_per_rad = 0.35
-# Use the wrist aggressively for the two orientation directions it can span;
-# Flexiv compensates the amplified motion while controlling the remaining task.
-wrist_priority_gain = 2.0
-# Mode 3 keeps X/Y position-controlled and enables force control only on Tool-Z.
-# No haptic translation is applied; sensed Tool-Z uses the target below.
+# Natural 1:1 wrist allocation; do not amplify the operator's rotation.
+wrist_priority_gain = 1.0
+# Mode 3 captures the probe contact point on clutch engagement and controls all
+# XYZ position components about that point. Haptic translation is discarded;
+# only haptic orientation is accepted. Tool-Z contact force uses the target
+# below as an added force task.
 # If probe +Z points down into the surface, pushing in +Z produces a sensed
 # reaction in -Z, hence -15 N.
 target_sensed_force_tool_z_n = -5.0
-# X/Y remain position controlled. This bounds the Flexiv internal Tool-Z
-# force-axis velocity while its built-in force loop adjusts contact.
-force_axis_max_velocity_m_s = 0.02
-# The arbitrary Tool-Z force frame is refreshed only when its orientation has
-# changed enough, because SetForceControlFrame is a blocking NRT call.
+# Default unified Mode-3 maximum motion on the force-controlled probe Z axis.
+# 0.005 m/s is the minimum accepted by Flexiv RDK 1.9.
+force_axis_max_velocity_m_s = 0.005
+# Do not step directly from a light contact to -15 N. The command begins at
+# the measured contact force and reaches the configured target over this time.
+force_command_ramp_s = 3.0
+# The default Python coordinator refreshes the arbitrary probe force frame only
+# when its orientation changes enough; SetForceControlFrame is a blocking NRT call.
 force_frame_update_hz = 10.0
 force_frame_update_angle_deg = 1.0
-# No external force sensor is used. Flexiv's compensated world wrench
-# is rotated by the live flange + q8/q9 transform into the probe frame. Force
-# is invariant to the TCP reference-point translation; wrist angle is required
-# for the probe-axis projection. Flexiv's own Tool-Z force controller closes
-# the inner loop directly at the configured target.
+# No external force sensor is used. The default coordinator and optional C++
+# backend both project Flexiv's compensated world wrench onto live probe Z.
 force_source = "filtered"
 force_display_lowpass_hz = 8.0
 
@@ -337,6 +536,14 @@ passivity_initial_energy_j = 0.02
 passivity_max_energy_j = 0.2
 
 [runtime]
+# Unified default workflow: Mode 1/2 use Flexiv Cartesian impedance; Mode 3
+# uses gentle hybrid operational-space position/orientation + Tool-Z force in
+# the same process. `teleop-osc` remains an explicit experimental all-torque
+# backend, but it is no longer required to access Mode 3.
+teleop_controller = "flexiv_impedance"
+# Structured local-UI telemetry. This only serializes already-computed state;
+# it does not call blocking IK or change either controller's update rate.
+ui_telemetry_rate_hz = 20.0
 # Real arm/wrist execution needs both fixed confirmation strings.
 arm = true
 confirm_robot = "MOVE_RIZON"

@@ -20,15 +20,28 @@ def main() -> int:
     output = PROJECT_ROOT / "config" / "wrist_inertia_calibration.json"
     try:
         profile = load_profile(DEFAULT_CONFIG)
+        identification = profile.document["inertia_identification"]
         print("Automatic wrist identification: saved zero is unchanged.")
-        print("Moving q8/q9 with smooth multi-sine excitation; Ctrl-C sends STOP.")
+        print(
+            "Moving q8/q9 with smooth multi-sine excitation: "
+            "duration={:g}s amplitude_deg={}; Ctrl-C sends STOP.".format(
+                float(identification["duration_s"]),
+                list(identification["amplitude_deg"]),
+            )
+        )
         collect(
             profile,
             raw,
-            duration_s=90.0,
-            amplitudes_deg=np.asarray([15.0, 30.0]),
-            position_kp_scale=np.asarray([0.35, 0.35]),
-            position_kd_scale=np.asarray([1.0, 1.0]),
+            duration_s=float(identification["duration_s"]),
+            amplitudes_deg=np.asarray(
+                identification["amplitude_deg"], dtype=float
+            ),
+            position_kp_scale=np.asarray(
+                identification["position_kp_scale"], dtype=float
+            ),
+            position_kd_scale=np.asarray(
+                identification["position_kd_scale"], dtype=float
+            ),
         )
         result = analyze(profile, raw, output)
         if result.get("calibration_status") != "PASS":
